@@ -1,0 +1,4 @@
+# Preserve the published bytes: manifest and provenance use exact SHA-256 hashes.
+* -text
+# Unified-diff context has a required leading space; check whitespace in the source checkout.
+source/native-ffb.patch whitespace=-blank-at-eol,-space-before-tab,cr-at-eol

@@ -1,0 +1,12 @@
+/upstream/
+/build/
+/dist/
+__pycache__/
+*.pyc
+*.dll
+!/runtime/dinput8.dll
+*.pdb
+*.exe
+*.obj
+*.log
+*.dmp

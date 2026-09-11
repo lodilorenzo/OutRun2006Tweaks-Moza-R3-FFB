@@ -1,0 +1,3277 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 971339e..c7fa0a3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -309,6 +309,9 @@ set(outrun2006tweaks_SOURCES
+ 	"src/input_names.hpp"
+ 	"src/interpolation.cpp"
+ 	"src/interpolation.hpp"
++	"src/native_ffb.hpp"
++	"src/native_rpm_leds.cpp"
++	"src/native_rpm_leds.hpp"
+ 	"src/network.cpp"
+ 	"src/overlay/about_ui.cpp"
+ 	"src/overlay/chatroom.cpp"
+@@ -381,6 +384,7 @@ target_link_libraries(outrun2006tweaks PUBLIC
+ 	Winmm.lib
+ 	Setupapi.lib
+ 	Crypt32.lib
++	dxguid.lib
+ )
+ 
+ target_link_options(outrun2006tweaks PUBLIC
+diff --git a/cmake.toml b/cmake.toml
+index 0eab128..6e422a3 100644
+--- a/cmake.toml
++++ b/cmake.toml
+@@ -113,7 +113,8 @@ link-libraries = [
+     "SDL3-static",
+     "Winmm.lib",
+     "Setupapi.lib",
+-    "Crypt32.lib"
++    "Crypt32.lib",
++    "dxguid.lib"
+ ]
+ 
+ [target.outrun2006tweaks.properties]
+diff --git a/src/contact_models.hpp b/src/contact_models.hpp
+new file mode 100644
+index 0000000..4825f2d
+--- /dev/null
++++ b/src/contact_models.hpp
+@@ -0,0 +1,143 @@
++#pragma once
++#include "native_ffb.hpp"
++
++// EXPERIMENTAL CONTACT TRIAL. Called by the existing player hook before Xbox
++// vibration mutates flags8. Flags are sampled evidence, not verified solidity.
++// Models make no device calls, actor-pointer reads or directional assumptions.
++namespace NativeFfb::Experimental
++{
++constexpr uint32_t WallBit = 0x20000, TrafficBit = 0x10000;
++enum class Contact { Unknown, Absent, Present };
++
++// Same texture for barrier and experimental traffic contact; callers keep
++// independent instances. No periodic impact retriggering or phase restart on edges.
++struct ContactTexture
++{
++    static constexpr double FrequencyHz = 8;
++    static constexpr float AttackMs = 60;
++    uint64_t tick = 0;
++    double phase = 0;
++    float amplitude = 0;
++    bool started = false, previousContact = false;
++
++    void reset() { *this = {}; }
++
++    LONG step(Contact contact, float speed, float strength, float fullSpeed, uint64_t now)
++    {
++        if ((contact != Contact::Absent && contact != Contact::Present) ||
++            !std::isfinite(speed) || speed <= 0.001f || speed > 10 ||
++            !std::isfinite(strength) || strength <= 0 ||
++            !std::isfinite(fullSpeed) || fullSpeed < 0.05f || fullSpeed > 10)
++        {
++            reset();
++            return 0;
++        }
++        if (started && now == tick) { reset(); return 0; } // Ambiguous duplicate: invalidate history.
++        if (!started || !Fresh(now, tick) || now - tick > 40)
++        {
++            reset();
++            started = true;
++            tick = now;
++            previousContact = contact == Contact::Present;
++            return 0; // Attach/resume/gap never starts with a nonzero command.
++        }
++        const auto dt = now - tick;
++        tick = now;
++        phase = std::fmod(phase + FrequencyHz * double(dt) / 1000.0, 1.0);
++        const bool present = contact == Contact::Present;
++        // ponytail: zero dropout tolerance and immediate release; this can sound
++        // choppy on flickering contacts. Add a bounded fade only with release evidence.
++        if (!present || !previousContact) amplitude = 0;
++        else
++        {
++            const float target = std::clamp(strength, 0.0f, MaxStrength) * DI_FFNOMINALMAX *
++                std::clamp(speed / fullSpeed, 0.0f, 1.0f);
++            amplitude = (std::min)(target, amplitude + target * float(dt) / AttackMs);
++        }
++        previousContact = present;
++        return LONG(std::sin(2 * std::numbers::pi * phase) * amplitude);
++    }
++};
++
++// Reuse the existing 120ms pulse/500ms edge cooldown, not a second waveform.
++// The flag adapter represents an experimental traffic hypothesis; it does not turn
++// a traffic flag into evidence of a barrier hit. Never AND with lagging flags8.
++struct TrafficJolt
++{
++    CollisionJolt pulse;
++    void reset() { pulse.reset(); }
++    LONG step(uint32_t flags4, float speed, float strength, uint64_t now)
++    {
++        if (pulse.started && now == pulse.tick) { reset(); return 0; }
++        return pulse.step((flags4 & TrafficBit) ? WallBit : 0, 0x100, speed, strength, now);
++    }
++};
++
++struct ContactSettings
++{
++    float barrierStrength = 0, barrierScrape = 0, trafficStrength = 0, trafficScrape = 0;
++    float fullSpeed = 1; // Reuses NativeFfbRoadFullSpeed raw calibration, not km/h.
++};
++
++struct ContactOutput
++{
++    LONG barrier = 0, traffic = 0, barrierScrape = 0, trafficScrape = 0;
++    bool barrierTriggered = false, trafficTriggered = false;
++    bool barrierSuppressed = false, trafficSuppressed = false;
++
++    // Same signed-wide sum and final cap as the baseline, exactly one clamp.
++    // Centre is already polarity-correct; invert only the accent terms here.
++    int64_t sum(LONG centre, LONG shift, LONG road, bool invert = false) const
++    {
++        const int64_t accents = int64_t(shift) + road + barrier + traffic + barrierScrape + trafficScrape;
++        return int64_t(centre) + (invert ? -accents : accents);
++    }
++    LONG mix(LONG centre, LONG shift, LONG road, bool invert = false) const
++    {
++        return LONG(std::clamp<int64_t>(sum(centre, shift, road, invert), -MaxForce, MaxForce));
++    }
++};
++
++struct ContactModels
++{
++    CollisionJolt barrier;
++    TrafficJolt traffic;
++    ContactTexture barrierTexture, trafficTexture;
++    void reset() { barrier.reset(); traffic.reset(); barrierTexture.reset(); trafficTexture.reset(); }
++
++    // Caller must reset on player/stage replacement and every lifecycle stop.
++    // valid=false is an immediate safety/unknown-data stop, never a cosmetic fade.
++    ContactOutput step(uint32_t flags4, uint32_t flags8, float speed,
++        const ContactSettings& settings, uint64_t now, bool valid = true)
++    {
++        if (!valid) { reset(); return {}; }
++        ContactOutput out;
++        out.barrier = barrier.step(flags4, flags8, speed, settings.barrierStrength, now);
++        out.traffic = traffic.step(flags4, speed, settings.trafficStrength, now);
++        if (barrier.pulsing && traffic.pulse.pulsing)
++        {
++            // First active envelope wins; simultaneous starts prefer the legacy
++            // barrier. Consume suppressed edges/cooldowns, never queue or extend.
++            if (barrier.triggered && !traffic.pulse.triggered)
++            {
++                out.barrierSuppressed = true;
++                out.barrier = 0;
++                barrier.pulsing = barrier.triggered = false;
++            }
++            else
++            {
++                out.trafficSuppressed = true;
++                out.traffic = 0;
++                traffic.pulse.pulsing = traffic.pulse.triggered = false;
++            }
++        }
++        out.barrierTriggered = barrier.triggered;
++        out.trafficTriggered = traffic.pulse.triggered;
++        out.barrierScrape = barrierTexture.step((flags4 & WallBit) ? Contact::Present : Contact::Absent,
++            speed, settings.barrierScrape, settings.fullSpeed, now);
++        out.trafficScrape = trafficTexture.step((flags4 & TrafficBit) ? Contact::Present : Contact::Absent,
++            speed, settings.trafficScrape, settings.fullSpeed, now);
++        return out;
++    }
++};
++}
+diff --git a/src/hooks_forcefeedback.cpp b/src/hooks_forcefeedback.cpp
+index d3681b1..f8e4d24 100644
+--- a/src/hooks_forcefeedback.cpp
++++ b/src/hooks_forcefeedback.cpp
+@@ -4,11 +4,68 @@
+ #include "hook_mgr.hpp"
+ #include "plugin.hpp"
+ #include "game_addrs.hpp"
++#include "input_manager.hpp"
++#include <cmath>
++#include "native_ffb.hpp"
++#include "contact_models.hpp"
++#include <sstream>
++#include <cstring>
+ 
+ #include "Xinput.h"
+ 
+ namespace Settings
+ {
++    Setting<bool> NativeFfbEnabled{ "FFB", "NativeFfbEnabled", false,
++        "EXPERIMENTAL physical-wheel centring. Disabled by default; requires restart and separately approved low-force validation." };
++    Setting<float> NativeFfbStrength{ "FFB", "NativeFfbStrength", 0.0f,
++        "Centring model strength 0..1; 0 silences all forces. This trial has a hard 50% final DI cap, not measured torque.", Range<float>{ 0.0f, NativeFfb::CentreForce::MaxStrength } };
++    Setting<float> NativeFfbShiftStrength{ "FFB", "NativeFfbShiftStrength", 0.0f,
++        "Optional gear-shift model amplitude 0..1 (0 disables). Requires enabled nonzero centring; this trial's combined output is capped at 50% DI.",
++        Range<float>{ 0.0f, NativeFfb::ShiftJolt::MaxStrength } };
++    Setting<float> NativeFfbCollisionStrength{ "FFB", "NativeFfbCollisionStrength", 0.0f,
++        "Experimental two-sided barrier-onset model amplitude 0..1 (0 disables). No wall direction inferred; trial total output capped at 50% DI.",
++        Range<float>{ 0.0f, NativeFfb::CollisionJolt::MaxStrength } };
++    Setting<float> NativeFfbScrapeStrength{ "FFB", "NativeFfbScrapeStrength", 0.0f,
++        "Experimental barrier contact texture, 0 disables. Fresh raw contact only; no release tail or inferred direction. Trial output capped at 50% DI.", Range<float>{ 0.0f, 1.0f } };
++    Setting<float> NativeFfbTrafficStrength{ "FFB", "NativeFfbTrafficStrength", 0.0f,
++        "Experimental traffic raw-edge pulse, 0 disables. Not a verified solid-contact detector. Trial output capped at 50% DI.", Range<float>{ 0.0f, 1.0f } };
++    Setting<float> NativeFfbTrafficScrapeStrength{ "FFB", "NativeFfbTrafficScrapeStrength", 0.0f,
++        "Experimental traffic raw-contact texture, 0 disables. Flashing/non-solid discrimination unverified. Trial output capped at 50% DI.", Range<float>{ 0.0f, 1.0f } };
++    Setting<float> NativeFfbRoadStrength{ "FFB", "NativeFfbRoadStrength", 0.0f,
++        "Smooth-road model amplitude 0..1 at full reference speed (0 disables). Trial final output cap is 50% DI.", Range<float>{ 0.0f, NativeFfb::MaxStrength } };
++    Setting<float> NativeFfbOffroadStrength{ "FFB", "NativeFfbOffroadStrength", 0.0f,
++        "Rough/off-road model amplitude 0..1, blended using the Xbox surface table. Trial final output cap is 50% DI.", Range<float>{ 0.0f, NativeFfb::MaxStrength } };
++    Setting<float> NativeFfbRoadFullSpeed{ "FFB", "NativeFfbRoadFullSpeed", 1.0f,
++        "Raw field_1C4 speed at full rumble amplitude; calibration units, NOT km/h.", Range<float>{ 0.05f, 10.0f } };
++    Setting<float> NativeFfbDriftDampingPercent{ "FFB", "NativeFfbDriftDampingPercent", 0.0f,
++        "Road feedback reduction during estimated drift: 20 = 20% less, 100 = silent road, 0 disables modifier. Independent of road endpoints; centring and other effects unchanged.", Range<float>{ 0.0f, 100.0f } };
++    Setting<int> NativeFfbDriftEnter{ "FFB", "NativeFfbDriftEnter", 2000,
++        "Provisional absolute raw-D34 entry cut; must exceed leave cut. Raw units, not slip angle.", Range<int>{ 1, 32767 } };
++    Setting<int> NativeFfbDriftLeave{ "FFB", "NativeFfbDriftLeave", 1000,
++        "Provisional absolute raw-D34 recovery cut. No independently measured detector latency.", Range<int>{ 0, 32766 } };
++    Setting<float> NativeFfbDriftMinimumSpeed{ "FFB", "NativeFfbDriftMinimumSpeed", .1f,
++        "Raw field_1C4 speed floor for experimental estimate, NOT km/h.", Range<float>{ .01f, 10.0f } };
++    Setting<float> NativeFfbDriftFrequency{ "FFB", "NativeFfbDriftFrequency", 8.0f,
++        "Experimental drift road-texture frequency, existing software oscillator; not a hardware periodic effect.", Range<float>{ 6.0f, 10.0f } };
++    Setting<int> NativeFfbVendorId{ "FFB", "NativeFfbVendorId", 0x346E,
++        "Physical wheel USB vendor ID (decimal in INI); exactly one matching VID/PID must be attached.", Range<int>{ 1, 65535 } };
++    Setting<int> NativeFfbProductId{ "FFB", "NativeFfbProductId", 0x0005,
++        "Physical wheel USB product ID (decimal in INI). Default is MOZA R3.", Range<int>{ 1, 65535 } };
++    Setting<float> NativeFfbCentre{ "FFB", "NativeFfbCentre", 0.0f,
++        "Physical steering centre calibration in normalized SDL units.", Range<float>{ -0.25f, 0.25f } };
++    Setting<float> NativeFfbDeadzone{ "FFB", "NativeFfbDeadzone", 0.02f,
++        "Centring deadzone around the calibrated centre.", Range<float>{ 0.0f, 0.25f } };
++    Setting<bool> NativeFfbInvert{ "FFB", "NativeFfbInvert", false,
++        "Reverse output polarity ONLY after a low-force direction test. Wrong polarity pulls away from centre." };
++	Setting<bool> NativeFfbDiagnostics{ "FFB", "NativeFfbDiagnostics", false,
++		"Log physical steering and raw car fields locally; this flag alone never enables wheel force output." };
++    Setting<bool> NativeFfbCollisionDiagnostics{ "FFB", "NativeFfbCollisionDiagnostics", false,
++        "P0 NO-OUTPUT probe: inhibits native FFB, Xbox rumble and LEDs for the session. F5 starts/stops one bounded capture; F6-F9 mark intent. Requires restart." };
++    Setting<int> NativeFfbProbeSeconds{ "FFB", "NativeFfbProbeSeconds", 15,
++        "P0 capture duration in wall-clock seconds (1..30), also capped at 4096 player samples. Requires restart.", Range<int>{ 1, 30 } };
++    Setting<int> NativeFfbProbeCase{ "FFB", "NativeFfbProbeCase", 0,
++        "P0 intended manoeuvre, not detected state. F6-F9 override for braking/walls/traffic. Requires restart.",
++        { "Unlabelled", "Brake", "Left wall", "Right wall", "Traffic", "Drift", "Surface", "Water", "Jump", "Crash flight" } };
+ 	Setting<int> VibrationMode{ "Controls", "VibrationMode", 0,
+ 		"Enable/disable/customize the Xbox vibration code. (NOTE: Some bluetooth controllers may cause framerate issues when vibration is enabled)",
+ 		{ "Disable", "Enable Xbox vibration", "L/R motors swapped", "L/R motors merged together" } };
+@@ -20,6 +77,22 @@ namespace Settings
+ 		Range<int>{ 0, 4 } };
+ }
+ 
++namespace
++{
++    bool probeSession = false;
++    NativeFfb::Probe::Capture probeCapture;
++    uint64_t probeInputTick = 0, probeDurationMs = 15000;
++    bool probeInputObserved = false, probeFlushAttempted = false, probeChecking = false;
++    unsigned probeCase = 0, probePlayer = 0;
++    EVWORK_CAR* probePreviousCar = nullptr;
++    LARGE_INTEGER probeFrequency{}, probeEpoch{};
++}
++
++bool NativeFfb_ProbeSession()
++{
++    return probeSession || Settings::NativeFfbCollisionDiagnostics;
++}
++
+ int VibrationUserId = 0;
+ int VibrationStrength = 10;
+ float VibrationLeftMotor = 0.f;
+@@ -27,7 +100,7 @@ float VibrationRightMotor = 0.f;
+ 
+ void SetVibration(int userId, float leftMotor, float rightMotor)
+ {
+-    if (!Settings::VibrationMode)
++    if (!Settings::VibrationMode || NativeFfb_ProbeSession())
+         return;
+     else if (Settings::VibrationMode == 2) // Swap L/R
+     {
+@@ -57,6 +130,401 @@ extern "C"
+     long _ftol2(double);
+ }
+ 
++// Existing Xbox vibration lookup below; also reused for native surface rumble.
++double __cdecl sub_1149C0(unsigned int surface, int loadType, DWORD* water);
++
++bool IsKeyPressed(int vk); // Existing high-bit/edge helper in hooks_framerate.cpp.
++
++// Single game/window thread. QPC measures hook cadence, NOT simulation identity.
++static uint64_t ProbeMicroseconds(LARGE_INTEGER counter)
++{
++    if (probeFrequency.QuadPart <= 0 || counter.QuadPart < probeEpoch.QuadPart) return 0;
++    return uint64_t(double(counter.QuadPart - probeEpoch.QuadPart) * 1000000.0 / double(probeFrequency.QuadPart));
++}
++
++static void CheckNativeProbe()
++{
++    if (!probeSession || probeChecking) return;
++    probeChecking = true;
++    const auto now = GetTickCount64();
++    const int mode = Game::current_mode ? *Game::current_mode : -1;
++    const bool focus = Game::GameHwnd() && !IsIconic(Game::GameHwnd()) && GetForegroundWindow() == Game::GameHwnd();
++    const bool blocked = Overlay::IsActive || Overlay::IsBindingDialogActive || isListeningForInput != ListenState::False;
++    const bool control = focus && !blocked;
++    // Poll even out of focus so a held key cannot become a fresh press on regain.
++    const bool toggle = IsKeyPressed(VK_F5);
++    for (unsigned i = 0; i < 4; ++i)
++        if (IsKeyPressed(VK_F6 + int(i)) && control && mode == STATE_GAME) probeCase = i + 1;
++    if (toggle && control)
++    {
++        if (probeCapture.running()) probeCapture.stop(NativeFfb::Probe::Stop::Operator);
++        else if (mode == STATE_GAME && probeInputObserved && NativeFfb::Fresh(now, probeInputTick) && probeFrequency.QuadPart > 0)
++            probeCapture.start(now, probeDurationMs);
++    }
++    probeCapture.poll(now); // Deadline continues through pause/car-hook gaps.
++    if (mode != STATE_GAME) probePreviousCar = nullptr;
++    const bool knownNonRacing = mode >= STATE_SYSTEM && mode <= STATE_SUMOREWARD && mode != STATE_GAME;
++    if (!probeFlushAttempted && probeCapture.canFlush(NativeFfb_ProbeSession(), knownNonRacing))
++    {
++        probeFlushAttempted = true; // No repeated writes/stalls if the filesystem fails.
++        try
++        {
++            std::ostringstream text;
++            NativeFfb::Probe::WriteCapture(text, probeCapture);
++            const auto bytes = text.str();
++            const auto name = L"NativeFfb-P0-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(now) + L".csv";
++            const auto file = CreateFileW(name.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
++            DWORD written = 0;
++            bool ok = false;
++            if (file != INVALID_HANDLE_VALUE)
++            {
++                ok = text.good() && bytes.size() <= MAXDWORD &&
++                    WriteFile(file, bytes.data(), DWORD(bytes.size()), &written, nullptr) && written == bytes.size();
++                if (!CloseHandle(file)) ok = false;
++            }
++            if (ok) spdlog::info("Native FFB P0: flushed {} samples, stop={}, capacity={}, file NativeFfb-P0-{}-{}.csv. "
++                "Markers are intent; capture completion is not runtime/signal validation.", probeCapture.count,
++                unsigned(probeCapture.reason), NativeFfb::Probe::Capacity, GetCurrentProcessId(), now);
++            else spdlog::error("Native FFB P0: capture write failed; no retry. Partial file must not be accepted.");
++        }
++        catch (...) { spdlog::error("Native FFB P0: capture serialization/write failed; no retry."); }
++    }
++    probeChecking = false;
++}
++
++static void CaptureNativeProbe(EVWORK_CAR* car)
++{
++    if (!probeSession || !probeCapture.running() || !car || car != Game::pl_car()) return;
++    // Existing named PC layout only. No actor-pointer reads or guessed action IDs.
++    static_assert(offsetof(EVWORK_CAR, flags_4) == 0x4 && offsetof(EVWORK_CAR, field_8) == 0x8);
++    static_assert(offsetof(EVWORK_CAR, OnRoadPlace_5C) == 0x5c && sizeof(OnRoadPlace) == 0x10);
++    static_assert(offsetof(OnRoadPlace, loadColiType_0) == 0 && offsetof(OnRoadPlace, curStageIdx_C) == 0xc);
++    static_assert(offsetof(EVWORK_CAR, car_id_10) == 0x10 && offsetof(EVWORK_CAR, field_178) == 0x178);
++    static_assert(offsetof(EVWORK_CAR, field_1C4) == 0x1c4 && offsetof(EVWORK_CAR, field_1D0) == 0x1d0);
++    static_assert(offsetof(EVWORK_CAR, field_1D4) == 0x1d4 && offsetof(EVWORK_CAR, cur_gear_208) == 0x208);
++    static_assert(offsetof(EVWORK_CAR, water_flag_24C) == 0x24c && sizeof(car->water_flag_24C) == 16);
++    static_assert(offsetof(EVWORK_CAR, field_264) == 0x264 && offsetof(EVWORK_CAR, field_268) == 0x268);
++    static_assert(offsetof(EVWORK_CAR, field_coli_281) == 0x281 && offsetof(EVWORK_CAR, crush_stiff_time_2F8) == 0x2f8);
++    LARGE_INTEGER begin{};
++    QueryPerformanceCounter(&begin);
++    NativeFfb::Probe::Sample s;
++    s.tick = GetTickCount64();
++    s.timeUs = ProbeMicroseconds(begin);
++    s.inputTick = probeInputTick;
++    if (probePreviousCar != car) { ++probePlayer; probePreviousCar = car; }
++    s.player = probePlayer; // Local ordinal, not an address or verified allocator generation.
++    s.carId = car->car_id_10;
++    s.marker = probeCase;
++    s.mode = Game::current_mode ? *Game::current_mode : -1;
++    s.pauseMenu = s.mode == STATE_SMPAUSEMENU ? 1 : s.mode == STATE_GAME ? 0 : -1;
++    s.focus = Game::GameHwnd() && !IsIconic(Game::GameHwnd()) && GetForegroundWindow() == Game::GameHwnd();
++    s.overlay = Overlay::IsActive;
++    s.binding = Overlay::IsBindingDialogActive || isListeningForInput != ListenState::False;
++    auto* pad = InputManager::instance.getPrimaryGamepad();
++    s.connected = pad && SDL_GamepadConnected(pad);
++    s.inputFresh = probeInputObserved && s.connected && NativeFfb::Fresh(s.tick, s.inputTick);
++    if (s.connected)
++    {
++        s.steer = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX) / 32768.0f;
++        s.accel = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
++        s.brake = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
++    }
++    s.gear = car->cur_gear_208;
++    s.flags4 = car->flags_4; s.flags8 = car->field_8; // Snapshot BEFORE CalcVibrationValues mutates flags8.
++    s.raw = { car->field_178, car->field_1C4, car->field_1D0, car->field_1D4,
++        car->field_264, car->field_268, car->crush_stiff_time_2F8 };
++    s.raw281 = car->field_coli_281;
++    s.surfaces = std::to_array(car->water_flag_24C);
++    s.stage = car->OnRoadPlace_5C.curStageIdx_C;
++    s.loadType = car->OnRoadPlace_5C.loadColiType_0;
++    s.finite = std::all_of(s.raw.begin(), s.raw.end(), [](float value) { return std::isfinite(value); });
++    // Restrict game lookup calls to the same racing context as native road output.
++    if (s.mode == STATE_GAME && s.loadType <= INT_MAX && Game::GetNowStageNum && Game::GetStageUniqueNum)
++    {
++        s.stageUnique = Game::GetStageUniqueNum(Game::GetNowStageNum(8));
++        DWORD water = 0;
++        s.roughness = NativeFfb::SurfaceRoughness(s.surfaces, int(s.loadType), sub_1149C0, &water);
++        s.surfaceValid = s.roughness >= 0;
++        s.water = water;
++    }
++    if (probeCapture.push(s))
++    {
++        LARGE_INTEGER end{};
++        QueryPerformanceCounter(&end);
++        const auto finish = ProbeMicroseconds(end);
++        probeCapture.samples[probeCapture.count - 1].captureUs = finish >= s.timeUs ? finish - s.timeUs : 0;
++    }
++}
++
++// Observation only: use the existing car hook, before the Xbox code mutates flags8.
++static void LogNativeFfbSignals(EVWORK_CAR* car)
++{
++    if (NativeFfb_ProbeSession()) { CaptureNativeProbe(car); return; }
++    if (!Settings::NativeFfbDiagnostics || !car || car != Game::pl_car())
++        return;
++    static ULONGLONG lastLog = 0;
++    const auto now = GetTickCount64();
++    if (now - lastLog < 500)
++        return;
++    auto* pad = InputManager::instance.getPrimaryGamepad();
++    const bool connected = pad && SDL_GamepadConnected(pad);
++    const float steer = connected ? SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX) / 32768.0f : 0.0f;
++    const bool finite = std::isfinite(car->field_1C4) && std::isfinite(car->field_1D0) &&
++        std::isfinite(car->field_1D4) && std::isfinite(car->field_264) && std::isfinite(car->field_268);
++    const int mode = Game::current_mode ? *Game::current_mode : -1;
++    const bool focus = Game::GameHwnd() && GetForegroundWindow() == Game::GameHwnd();
++    const int accel = connected ? SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) : 0;
++    const int brake = connected ? SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) : 0;
++    if (Settings::NativeFfbDiagnostics && now - lastLog >= 500)
++    {
++        lastLog = now;
++        spdlog::info("Native FFB diagnostic: mode={} focus={} pad={} steer={:.4f} accel={} brake={} "
++            "raw1C4={:.5f} raw1D0={:.5f} raw1D4={:.5f} raw264={:.5f} raw268={:.5f} finite={} gear={} flags8=0x{:X} surface=0x{:X}",
++            mode, focus, connected, steer, accel, brake, car->field_1C4, car->field_1D0,
++            car->field_1D4, car->field_264, car->field_268, finite, car->cur_gear_208, car->field_8, car->water_flag_24C[0]);
++    }
++}
++
++namespace
++{
++    NativeFfb::Device nativeDevice;
++    NativeFfb::CentreForce nativeCentre;
++    NativeFfb::ShiftJolt nativeShift;
++    NativeFfb::RoadRumble nativeRoad;
++    NativeFfb::ExperimentalDriftEstimate nativeDrift;
++    NativeFfb::Experimental::ContactModels nativeContacts;
++    std::array<int64_t, 3> nativeStageContext{ -1, -1, -1 };
++    std::array<LONG, 4> nativeContactMin{}, nativeContactMax{};
++    uint64_t nativeContactLogTick = 0;
++    unsigned nativeClipped = 0;
++    LONG nativeLastForce = 0;
++    EVWORK_CAR* nativePlayerCar = nullptr;
++    bool nativeArmed = false, nativeFault = false, nativeExiting = false;
++    bool nativeBusy = false, nativeStopPending = false, nativeConnected = false;
++    int nativeVendor = 0, nativeProduct = 0;
++    float nativeSteer = 0;
++    uint64_t nativeInputTick = 0, nativeCarTick = 0, nativeRoadLogTick = 0;
++    LONG nativeRoadMin = 0, nativeRoadMax = 0;
++
++    void ResetNativeModels()
++    {
++        nativeCentre.reset();
++        nativeShift.reset();
++        nativeRoad.reset();
++        nativeDrift.reset();
++        nativeContacts.reset();
++        nativeStageContext = { -1, -1, -1 };
++        nativeContactMin = nativeContactMax = {};
++        nativeContactLogTick = 0;
++        nativeClipped = 0;
++        nativePlayerCar = nullptr;
++        nativeRoadLogTick = 0;
++        nativeRoadMin = nativeRoadMax = 0;
++    }
++
++    bool NativeAllowed(uint64_t now)
++    {
++        return NativeFfb::Allowed(nativeArmed && Settings::NativeFfbEnabled && !NativeFfb_ProbeSession() && !nativeFault && !nativeExiting &&
++            Settings::UseNewInput && Settings::VibrationMode == 0 &&
++            Settings::NativeFfbVendorId == nativeVendor && Settings::NativeFfbProductId == nativeProduct &&
++            std::isfinite(Settings::NativeFfbStrength.get()) && Settings::NativeFfbStrength > 0,
++            Game::current_mode && *Game::current_mode == STATE_GAME,
++            Game::GameHwnd() && !IsIconic(Game::GameHwnd()) && GetForegroundWindow() == Game::GameHwnd(),
++            Overlay::IsActive || Overlay::IsBindingDialogActive || isListeningForInput != ListenState::False,
++            nativeConnected, now, nativeInputTick, nativeCarTick);
++    }
++
++    // DirectInput may dispatch window messages. Defer nested stops until the
++    // in-flight call unwinds; never release an effect from inside its own call.
++    struct NativeCall
++    {
++        NativeCall() { nativeBusy = true; }
++        ~NativeCall()
++        {
++            nativeBusy = false;
++            if (nativeStopPending) NativeFfb_Stop(nativeExiting);
++        }
++    };
++
++    void NativeFail(HRESULT hr)
++    {
++        if (!nativeFault)
++            spdlog::error("Native FFB: output fault 0x{:08X}; disabled until restart", unsigned(hr));
++        nativeFault = true;
++        nativeStopPending = true;
++    }
++
++    void UpdateNativeFfb(EVWORK_CAR* car)
++    {
++        if (!nativeArmed || nativeExiting || nativeBusy || !car || car != Game::pl_car()) return;
++        const auto now = GetTickCount64();
++        const bool duplicateContactTick = car == nativePlayerCar && now <= nativeCarTick;
++        if (car != nativePlayerCar || !NativeFfb::Fresh(now, nativeCarTick))
++            ResetNativeModels();
++        nativePlayerCar = car;
++        nativeCarTick = now;
++        if (!NativeAllowed(now)) { NativeFfb_Stop(); return; }
++        NativeCall call;
++        HRESULT hr = S_OK;
++        if (!nativeDevice.opened())
++        {
++            hr = nativeDevice.open(Game::DirectInput8_ptr ? Game::DirectInput8() : nullptr,
++                Game::GameHwnd(), nativeVendor, nativeProduct);
++            if (FAILED(hr)) { NativeFail(hr); return; }
++            spdlog::info("Native FFB: dedicated foreground output opened, VID={:04X} PID={:04X}, lease={}ms, cap={}%",
++                nativeVendor, nativeProduct, NativeFfb::LeaseMs, NativeFfb::DeviceMaxForce / 100);
++        }
++        // Opening/acquiring a driver can be slow or dispatch a focus/exit message.
++        if (nativeStopPending || !NativeAllowed(GetTickCount64()) || car != Game::pl_car())
++        { nativeStopPending = true; return; }
++        // Same verified stage reads used by P0, only in allowed racing context.
++        const int uniqueStage = Game::GetNowStageNum && Game::GetStageUniqueNum
++            ? Game::GetStageUniqueNum(Game::GetNowStageNum(8)) : -1;
++        const std::array<int64_t, 3> context{ car->OnRoadPlace_5C.curStageIdx_C,
++            car->OnRoadPlace_5C.loadColiType_0, uniqueStage };
++        const bool contactContextValid = uniqueStage >= 0 && context[1] <= INT_MAX;
++        if (context != nativeStageContext)
++        {
++            ResetNativeModels(); // Stage/load changes cannot manufacture impacts or shifts.
++            nativePlayerCar = car;
++            nativeStageContext = context;
++        }
++        const LONG centre = nativeCentre.step(nativeSteer, Settings::NativeFfbStrength,
++            Settings::NativeFfbCentre, Settings::NativeFfbDeadzone, Settings::NativeFfbInvert, now);
++        if (!nativeCentre.started) ResetNativeModels(); // Invalid steering/calibration silences all accents.
++        const uint32_t gear = car->cur_gear_208;
++        const float speed = car->field_1C4;
++        const uint32_t flags4 = car->flags_4, flags8 = car->field_8;
++        const auto surfaces = std::to_array(car->water_flag_24C); // Snapshot before driver callbacks.
++        const bool roadEnabled = Settings::NativeFfbRoadStrength > 0 || Settings::NativeFfbOffroadStrength > 0;
++        const float roughness = roadEnabled ? NativeFfb::SurfaceRoughness(surfaces,
++            int(car->OnRoadPlace_5C.loadColiType_0), sub_1149C0) : -1.0f;
++        // Same direct raw reads/layout already exercised by the no-output recorder.
++        // No pointer chasing, new hook or change to before-original sampling order.
++        static_assert(offsetof(EVWORK_CAR, gapD34) == 0xd34 && sizeof(car->gapD34) == 2);
++        static_assert(offsetof(EVWORK_CAR, flags_2F0) == 0x2f0 && sizeof(car->flags_2F0) == 4);
++        int16_t rawD34 = 0;
++        std::memcpy(&rawD34, car->gapD34, sizeof(rawD34));
++        const bool driftEnabled = Settings::NativeFfbDriftDampingPercent > 0;
++        if (!driftEnabled) nativeDrift.reset();
++        const auto drift = driftEnabled ? nativeDrift.step(rawD34, flags4, flags8, speed,
++            nativeCentre.started && contactContextValid && roughness >= 0 && car->flags_2F0 == 4,
++            now, Settings::NativeFfbDriftEnter, Settings::NativeFfbDriftLeave, Settings::NativeFfbDriftMinimumSpeed)
++            : NativeFfb::DriftStatus::Unknown;
++        // Unknown/contact cannot retain the drift modifier. Healthy recovery
++        // uses the P3 fade; phase and ordinary road feedback remain intact here.
++        if (drift == NativeFfb::DriftStatus::Unknown) nativeRoad.driftAmount = 0;
++        LONG shift = nativeCentre.started ? nativeShift.step(gear, Settings::NativeFfbShiftStrength, now) : 0;
++        LONG road = nativeCentre.started ? nativeRoad.step(speed, roughness, Settings::NativeFfbRoadStrength,
++            Settings::NativeFfbOffroadStrength, Settings::NativeFfbRoadFullSpeed, now,
++            drift, Settings::NativeFfbDriftDampingPercent, Settings::NativeFfbDriftFrequency) : 0;
++        const NativeFfb::Experimental::ContactSettings contactSettings{
++            Settings::NativeFfbCollisionStrength, Settings::NativeFfbScrapeStrength,
++            Settings::NativeFfbTrafficStrength, Settings::NativeFfbTrafficScrapeStrength,
++            Settings::NativeFfbRoadFullSpeed };
++        const auto contact = nativeContacts.step(flags4, flags8, speed, contactSettings, now,
++            nativeCentre.started && contactContextValid && !duplicateContactTick);
++        const int64_t preclamp = contact.sum(centre, shift, road, Settings::NativeFfbInvert);
++        const LONG force = NativeFfb::LimitOutput(preclamp);
++        // Recheck after all game reads/calculation, before the only output submission.
++        if (nativeStopPending || !NativeAllowed(GetTickCount64()) || car != Game::pl_car())
++        { nativeStopPending = true; return; }
++        hr = nativeDevice.submit(force);
++        if (SUCCEEDED(hr)) nativeLastForce = force;
++        if (FAILED(hr)) NativeFail(hr); // Never recreate/retry a failed output automatically.
++        else if (Settings::NativeFfbDiagnostics)
++        {
++            if (contact.barrierTriggered || contact.trafficTriggered || contact.barrierSuppressed || contact.trafficSuppressed)
++                spdlog::info("Native FFB contact trial: barrier={} traffic={} suppressedBarrier={} suppressedTraffic={} flags4=0x{:X} flags8=0x{:X} speed={:.5f}",
++                    contact.barrierTriggered, contact.trafficTriggered, contact.barrierSuppressed, contact.trafficSuppressed, flags4, flags8, speed);
++            const std::array<LONG, 4> components{ contact.barrier, contact.traffic, contact.barrierScrape, contact.trafficScrape };
++            for (size_t i = 0; i < components.size(); ++i)
++            {
++                nativeContactMin[i] = (std::min)(nativeContactMin[i], components[i]);
++                nativeContactMax[i] = (std::max)(nativeContactMax[i], components[i]);
++            }
++            nativeClipped += preclamp != force;
++            if (now - nativeContactLogTick >= 500)
++            {
++                spdlog::info("Native FFB contact trial: barrier={}/{} traffic={}/{} wallTexture={}/{} trafficTexture={}/{} preclamp={} output={} clippedSamples={} cap=5000",
++                    nativeContactMin[0], nativeContactMax[0], nativeContactMin[1], nativeContactMax[1],
++                    nativeContactMin[2], nativeContactMax[2], nativeContactMin[3], nativeContactMax[3], preclamp, force, nativeClipped);
++                nativeContactLogTick = now;
++                nativeContactMin = nativeContactMax = {};
++                nativeClipped = 0;
++            }
++            if (shift)
++                spdlog::info("Native FFB: shift output gear={} jolt={} combined={} result=0x{:08X}",
++                    gear, shift, force, unsigned(hr)); // Accepted command, not measured wheel torque.
++            if (roadEnabled)
++            {
++                nativeRoadMin = (std::min)(nativeRoadMin, road);
++                nativeRoadMax = (std::max)(nativeRoadMax, road);
++                if (now - nativeRoadLogTick >= 500)
++                {
++                    // Min/max catches both waveform polarities without aliasing the 500ms log cadence.
++                    spdlog::info("Native FFB: road output rawSpeed={:.4f} roughness={:.4f} min={} max={} combined={} masks={:X}/{:X}/{:X}/{:X}",
++                        speed, roughness, nativeRoadMin, nativeRoadMax, force, surfaces[0], surfaces[1], surfaces[2], surfaces[3]);
++                    if (driftEnabled)
++                        spdlog::info("Native FFB DRIFT ESTIMATE: rawD34={} raw2F0=0x{:X} state={} amount={:.3f} amplitudeDI={:.1f} dampingPercent={} frequency={} (0 unknown/1 grip/2 estimated drift; NOT validated)",
++                            rawD34, car->flags_2F0, int(drift), nativeRoad.driftAmount, nativeRoad.amplitude,
++                            Settings::NativeFfbDriftDampingPercent.get(), Settings::NativeFfbDriftFrequency.get());
++                    nativeRoadLogTick = now;
++                    nativeRoadMin = nativeRoadMax = 0;
++                }
++            }
++        }
++    }
++}
++
++void NativeFfb_Stop(bool shutdown)
++{
++    if (shutdown && NativeFfb_ProbeSession()) probeCapture.stop(NativeFfb::Probe::Stop::Shutdown);
++    nativeExiting |= shutdown;
++    nativeStopPending = true;
++    ResetNativeModels();
++    if (nativeBusy) return;
++    NativeCall call;
++    nativeStopPending = false;
++    const HRESULT hr = (nativeExiting || nativeFault || !Settings::NativeFfbEnabled || Settings::NativeFfbStrength <= 0)
++        ? nativeDevice.close() : nativeDevice.suspend();
++    if (nativeLastForce || shutdown)
++        spdlog::info("Native FFB contact trial: stop request shutdown={} lastCommand={} result=0x{:08X}; physical stop requires operator confirmation",
++            shutdown, nativeLastForce, unsigned(hr));
++    nativeLastForce = 0;
++    if (FAILED(hr))
++    {
++        // Foreground DirectInput auto-unacquires on focus loss. These two stop
++        // errors are expected; other cleanup failures disable further output.
++        if (hr != DIERR_NOTACQUIRED && hr != DIERR_INPUTLOST) NativeFail(hr);
++        spdlog::warn("Native FFB: stop/cleanup returned 0x{:08X}", unsigned(hr));
++    }
++}
++
++void NativeFfb_InputUpdated()
++{
++    if (NativeFfb_ProbeSession())
++    {
++        probeInputTick = GetTickCount64();
++        probeInputObserved = true;
++        CheckNativeProbe();
++        return;
++    }
++    if (!nativeArmed || nativeExiting) return;
++    auto* pad = InputManager::instance.getPrimaryGamepad();
++    nativeConnected = pad && SDL_GamepadConnected(pad) &&
++        SDL_GetGamepadVendor(pad) == nativeVendor && SDL_GetGamepadProduct(pad) == nativeProduct;
++    nativeSteer = nativeConnected ? SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX) / 32768.0f : 0.0f;
++    nativeInputTick = GetTickCount64();
++    NativeFfb_Check();
++}
++
++void NativeFfb_Check()
++{
++    CheckNativeProbe(); // Also observes pause/menu transitions when the car hook is idle.
++    if (nativeArmed && !NativeAllowed(GetTickCount64())) NativeFfb_Stop();
++}
++
+ class Vibration : public Hook
+ {
+     const static int GamePlCar_Ctrl_Addr = 0xA8330;
+@@ -64,10 +532,13 @@ class Vibration : public Hook
+     inline static SafetyHookInline GamePlCar_Ctrl = {};
+     static void GamePlCar_Ctrl_Hook(EVWORK_CAR* car)
+     {
++        LogNativeFfbSignals(car);
++        UpdateNativeFfb(car);
+         CalcVibrationValues(car);
+         SetVibration(0, VibrationLeftMotor, VibrationRightMotor);
+ 
+         GamePlCar_Ctrl.call(car);
++        NativeRpmLeds_Update(car); // Read the dashboard value after the original car update.
+     }
+ 
+ public:
+@@ -78,6 +549,15 @@ public:
+ 
+     void declare_settings() override
+     {
++        Settings::NativeFfbEnabled.needs_restart();
++        Settings::NativeFfbCollisionDiagnostics.needs_restart();
++        Settings::NativeFfbProbeSeconds.needs_restart();
++        Settings::NativeFfbProbeCase.needs_restart();
++        Settings::NativeFfbDriftEnter.needs_restart();
++        Settings::NativeFfbDriftLeave.needs_restart();
++        Settings::NativeFfbDriftMinimumSpeed.needs_restart();
++        Settings::NativeFfbVendorId.needs_restart();
++        Settings::NativeFfbProductId.needs_restart();
+         Settings::VibrationStrength.watch([] { VibrationStrength = Settings::VibrationStrength; });
+ 
+         Settings::VibrationControllerId.needs_restart();
+@@ -88,6 +568,24 @@ public:
+     {
+         VibrationStrength = Settings::VibrationStrength;
+         VibrationUserId = Settings::VibrationControllerId;
++        probeSession = Settings::NativeFfbCollisionDiagnostics; // Permanent session latch, even if the setting is toggled off.
++        nativeArmed = Settings::NativeFfbEnabled && !NativeFfb_ProbeSession();
++        if (probeSession)
++        {
++            probeDurationMs = uint64_t(std::clamp(Settings::NativeFfbProbeSeconds.get(), 1, 30)) * 1000;
++            probeCase = unsigned(std::clamp(Settings::NativeFfbProbeCase.get(), 0, 9));
++            QueryPerformanceFrequency(&probeFrequency);
++            QueryPerformanceCounter(&probeEpoch);
++            spdlog::info("Native FFB P0: native force/Xbox rumble/LED output inhibited for session. "
++                "F5 starts/stops one {}s / 4096-sample capture; F6 brake, F7 left wall, F8 right wall, F9 traffic. "
++                "Initial case={}. Pause or leave race to flush; crashing/exiting during racing may lose the buffer.",
++                probeDurationMs / 1000, probeCase);
++        }
++        nativeVendor = Settings::NativeFfbVendorId;
++        nativeProduct = Settings::NativeFfbProductId;
++        spdlog::info("Native FFB v0.2.0: armed={} centre={} driftDampingPercent={} enter={} leave={} minimumSpeed={} finalCap=5000 leaseMs=100; provisional estimate, NOT validated drift or measured torque",
++            nativeArmed, Settings::NativeFfbStrength.get(), Settings::NativeFfbDriftDampingPercent.get(),
++            Settings::NativeFfbDriftEnter.get(), Settings::NativeFfbDriftLeave.get(), Settings::NativeFfbDriftMinimumSpeed.get());
+ 
+         GamePlCar_Ctrl = safetyhook::create_inline(Module::exe_ptr(GamePlCar_Ctrl_Addr), GamePlCar_Ctrl_Hook);
+ 
+diff --git a/src/input_manager.cpp b/src/input_manager.cpp
+index 68e0057..355fdeb 100644
+--- a/src/input_manager.cpp
++++ b/src/input_manager.cpp
+@@ -48,10 +48,19 @@ void InputManager::init(HWND hwnd)
+ 	ensureOverlayBindable();
+ }
+ 
++void InputManager_Shutdown()
++{
++	InputManager::instance.shutdown();
++}
++
+ void InputManager_Update()
+ {
+ 	if (Settings::UseNewInput)
++	{
+ 		InputManager::instance.update();
++		NativeFfb_InputUpdated();
++		NativeRpmLeds_InputUpdated();
++	}
+ }
+ 
+ // Only meaningful with the new input system; callers fall back to their own
+diff --git a/src/input_manager.hpp b/src/input_manager.hpp
+index ad117b3..77a9f3b 100644
+--- a/src/input_manager.hpp
++++ b/src/input_manager.hpp
+@@ -14,6 +14,8 @@
+ #include <optional>
+ #include <istream>
+ #include "input_names.hpp"
++#include "native_ffb.hpp"
++#include "native_rpm_leds.hpp"
+ 
+ #include "imgui.h"
+ #include <format>
+@@ -268,6 +270,7 @@ private:
+ 	int primaryControllerIndex = -1;
+ 
+ 	SDL_Window* window = nullptr;
++	bool shuttingDown = false;
+ 
+ 	// cached values as of last update call
+ 	std::array<InputState, size_t(ADChannel::Count)> volumes;
+@@ -381,6 +384,8 @@ private:
+ 
+ 	void onControllerAdded(SDL_JoystickID instanceId)
+ 	{
++		if (shuttingDown)
++			return;
+ 		spdlog::debug(__FUNCTION__ "({})", instanceId);
+ 
+ 		SDL_Gamepad* controller = SDL_OpenGamepad(instanceId);
+@@ -410,6 +415,8 @@ private:
+ 	void onControllerRemoved(SDL_JoystickID instanceId)
+ 	{
+ 		spdlog::debug(__FUNCTION__ "(instance {})", instanceId);
++		// Release output before SDL closes a polling handle; no driver calls under our mutex.
++		NativeFfb_Stop();
+ 
+ 		std::lock_guard<std::mutex> lock(mtx);
+ 
+@@ -433,10 +440,35 @@ private:
+ 	}
+ 
+ public:
+-	~InputManager()
++	// SDL/DirectInput calls from the static destructor run under the loader lock.
++	// Close gamepads through shutdown() while the game window still exists.
++	// ponytail: process-lifetime DLL; abnormal exit leaves remaining handles to
++	// the OS. Runtime DLL unloading would require an explicit shutdown contract.
++	~InputManager() = default;
++
++	void shutdown()
+ 	{
+-		for (auto controller : controllers)
++		std::vector<SDL_Gamepad*> closing;
++		{
++			std::lock_guard<std::mutex> lock(mtx);
++			if (shuttingDown)
++				return;
++			shuttingDown = true;
++			closing.swap(controllers);
++			primaryControllerIndex = -1;
++		}
++		// Stop/release output before SDL releases its separate polling handle.
++		NativeFfb_Stop(true);
++		NativeRpmLeds_Stop(true);
++		// Do not hold our mutex across driver calls that can dispatch messages.
++		spdlog::info("InputManager: orderly shutdown starting ({} gamepads)", closing.size());
++		for (auto controller : closing)
+ 			SDL_CloseGamepad(controller);
++		volumes = {};
++		modStates = {};
++		switch_current = switch_previous = switch_overlay = 0;
++		raw_buttons = raw_pressed = raw_released = 0;
++		spdlog::info("InputManager: orderly shutdown complete");
+ 	}
+ 
+ 	SDL_Gamepad* getPrimaryGamepad()
+@@ -817,6 +849,7 @@ public:
+ 				onControllerRemoved(event.gdevice.which);
+ 				break;
+ 			case SDL_EVENT_QUIT:
++				shutdown();
+ 				PostQuitMessage(0);
+ 				break;
+ 			}
+@@ -865,7 +898,11 @@ public:
+ 
+ 	void update()
+ 	{
++		if (shuttingDown)
++			return;
+ 		pumpSdlEvents();
++		if (shuttingDown) // WM_CLOSE may have arrived while pumping messages.
++			return;
+ 
+ 		auto* gamepad = getPrimaryGamepad();
+ 
+@@ -1024,6 +1061,7 @@ public:
+ 
+ 	void setVibration(WORD left, WORD right)
+ 	{
++		if (NativeFfb_ProbeSession()) return; // Guard the common SDL rumble entry, not just the Xbox caller.
+ 		auto* controller = getPrimaryGamepad();
+ 		if (!controller)
+ 			return;
+diff --git a/src/input_names.hpp b/src/input_names.hpp
+index b8e58ec..07e623e 100644
+--- a/src/input_names.hpp
++++ b/src/input_names.hpp
+@@ -72,6 +72,19 @@ namespace InputNames
+ 		{ SDL_GAMEPAD_BUTTON_DPAD_DOWN,      "DPad-Down",  "D-Pad Down",   nullptr,         nullptr,    nullptr },
+ 		{ SDL_GAMEPAD_BUTTON_DPAD_LEFT,      "DPad-Left",  "D-Pad Left",   nullptr,         nullptr,    nullptr },
+ 		{ SDL_GAMEPAD_BUTTON_DPAD_RIGHT,     "DPad-Right", "D-Pad Right",  nullptr,         nullptr,    nullptr },
++		// Wheels use SDL's extended slots too; every captured button needs a stable INI name.
++		{ SDL_GAMEPAD_BUTTON_GUIDE,         "Guide",    "Guide",          nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_MISC1,         "Misc1",    "Misc 1",         nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, "Paddle1",  "Right Paddle 1", nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_LEFT_PADDLE1,  "Paddle2",  "Left Paddle 1",  nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2, "Paddle3",  "Right Paddle 2", nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_LEFT_PADDLE2,  "Paddle4",  "Left Paddle 2",  nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_TOUCHPAD,      "Touchpad", "Touchpad",       nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_MISC2,         "Misc2",    "Misc 2",         nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_MISC3,         "Misc3",    "Misc 3",         nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_MISC4,         "Misc4",    "Misc 4",         nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_MISC5,         "Misc5",    "Misc 5",         nullptr, nullptr, nullptr },
++		{ SDL_GAMEPAD_BUTTON_MISC6,         "Misc6",    "Misc 6",         nullptr, nullptr, nullptr },
+ 	};
+ 
+ 	struct AxisNames
+diff --git a/src/native_ffb.hpp b/src/native_ffb.hpp
+new file mode 100644
+index 0000000..59c4804
+--- /dev/null
++++ b/src/native_ffb.hpp
+@@ -0,0 +1,570 @@
++#pragma once
++
++#include <Windows.h>
++#include <dinput.h>
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <numbers>
++#include <ostream>
++#include <iomanip>
++#include <locale>
++
++namespace NativeFfb
++{
++constexpr DWORD LeaseMs = 100;
++constexpr LONG MaxForce = DI_FFNOMINALMAX; // 100% combined DirectInput output, NOT measured torque.
++constexpr float MaxStrength = float(MaxForce) / DI_FFNOMINALMAX;
++// v0.2.0 retains the operator-tested 50% cap, regardless of INI/overlay values.
++constexpr LONG DeviceMaxForce = 5000;
++inline LONG LimitOutput(int64_t magnitude)
++{
++    return LONG(std::clamp<int64_t>(magnitude, -DeviceMaxForce, DeviceMaxForce));
++}
++
++inline bool Fresh(uint64_t now, uint64_t sample)
++{
++    return now >= sample && now - sample < LeaseMs;
++}
++
++inline bool Allowed(bool enabled, bool racing, bool focused, bool blocked,
++    bool connected, uint64_t now, uint64_t inputTick, uint64_t carTick)
++{
++    return enabled && racing && focused && !blocked && connected &&
++        Fresh(now, inputTick) && Fresh(now, carTick);
++}
++
++// Physical SDL steering only; no guessed car-physics offsets.
++struct CentreForce
++{
++    static constexpr float MaxStrength = NativeFfb::MaxStrength; // Actual 0..1 output, not normalized to the old 10% cap.
++    float level = 0;
++    uint64_t tick = 0;
++    bool started = false;
++
++    void reset() { level = 0; tick = 0; started = false; }
++
++    LONG step(float steer, float strength, float centre, float deadzone, bool invert, uint64_t now)
++    {
++        if (!std::isfinite(steer) || std::abs(steer) > 1 || !std::isfinite(strength) || strength <= 0 ||
++            !std::isfinite(centre) || std::abs(centre) > 0.25f ||
++            !std::isfinite(deadzone) || deadzone < 0 || deadzone > 0.25f)
++        {
++            reset();
++            return 0;
++        }
++        if (!started || !Fresh(now, tick))
++        {
++            reset();
++            started = true;
++            tick = now;
++            return 0; // First sample after every stop/stall starts at zero.
++        }
++        const float dt = float((std::min)(now - tick, uint64_t(20))) / 1000.0f;
++        tick = now;
++        const float offset = std::clamp(steer - centre, -1.0f, 1.0f);
++        const float displacement = (std::max)(0.0f, std::abs(offset) - deadzone) / (1.0f - deadzone);
++        const float target = -std::copysign(displacement, offset) * (invert ? -1.0f : 1.0f) *
++            std::clamp(strength, 0.0f, MaxStrength) * DI_FFNOMINALMAX;
++        // Never retain a pull across centre/sign reversal or after lowering the cap.
++        if (target == 0 || level * target < 0)
++            level = 0;
++        const float slew = 1000.0f * dt; // Unchanged slew: at least 10 s from zero to the 100% ceiling.
++        level += std::clamp(target - level, -slew, slew);
++        const float cap = std::clamp(strength, 0.0f, MaxStrength) * DI_FFNOMINALMAX;
++        level = std::clamp(level, -cap, cap);
++        return LONG(level);
++    }
++};
++
++// One smooth positive/negative cycle on an observed adjacent gear change.
++// First sample, invalid gear, pause/reset and stale data never manufacture a shift.
++struct ShiftJolt
++{
++    static constexpr uint64_t DurationMs = 160;
++    static constexpr uint64_t CooldownMs = 300;
++    static constexpr float MaxStrength = NativeFfb::MaxStrength;
++    uint32_t previousGear = 0;
++    uint64_t tick = 0, pulseTick = 0;
++    bool pulsing = false, hasPulse = false;
++
++    void reset() { *this = {}; }
++
++    LONG step(uint32_t gear, float strength, uint64_t now)
++    {
++        if (gear < 1 || gear > 6 || !std::isfinite(strength) || strength <= 0)
++        {
++            reset();
++            return 0;
++        }
++        if (!previousGear || !Fresh(now, tick))
++        {
++            reset();
++            previousGear = gear;
++            tick = now;
++            return 0;
++        }
++        tick = now;
++        if (pulsing && now - pulseTick >= DurationMs) pulsing = false;
++        const int delta = int(gear) - int(previousGear);
++        previousGear = gear;
++        if (std::abs(delta) > 1)
++        {
++            pulsing = false; // Do not interpret a reset/multi-gear jump as an impact.
++            return 0;
++        }
++        if (delta && !pulsing && (!hasPulse || now - pulseTick >= CooldownMs))
++        {
++            pulseTick = now;
++            pulsing = hasPulse = true;
++        }
++        if (!pulsing) return 0;
++        // ponytail: game-tick sine, not hardware periodic output; upgrade only if low-FPS aliasing matters.
++        const double phase = 2 * std::numbers::pi * double(now - pulseTick) / double(DurationMs);
++        return LONG(std::sin(phase) * std::clamp(strength, 0.0f, MaxStrength) * DI_FFNOMINALMAX);
++    }
++};
++
++// Conservative onset signature from the labelled PC capture, not a wall-side decoder.
++struct CollisionJolt
++{
++    static constexpr uint64_t DurationMs = 120;
++    static constexpr uint64_t CooldownMs = 500;
++    static constexpr float MaxStrength = NativeFfb::MaxStrength;
++    uint64_t tick = 0, pulseTick = 0;
++    bool started = false, previousOnset = false, pulsing = false, hasPulse = false, triggered = false;
++
++    void reset() { *this = {}; }
++
++    LONG step(uint32_t flags4, uint32_t flags8, float speed, float strength, uint64_t now)
++    {
++        triggered = false;
++        if (!std::isfinite(speed) || speed <= 0.001f || speed > 10 ||
++            !std::isfinite(strength) || strength <= 0)
++        {
++            reset();
++            return 0;
++        }
++        // ponytail: require the captured 0x20000 + 0x100 onset pair; broaden only with additional labelled contact evidence.
++        const bool onset = (flags4 & 0x20000) && (flags8 & 0x100);
++        if (!started || !Fresh(now, tick) || now - tick > 40)
++        {
++            reset();
++            started = true;
++            previousOnset = onset;
++            tick = now;
++            return 0; // Never kick on attach, resume, invalid data or undersampled recovery.
++        }
++        tick = now;
++        const bool edge = onset && !previousOnset;
++        previousOnset = onset;
++        if (pulsing && now - pulseTick >= DurationMs) pulsing = false;
++        if (edge && !pulsing && (!hasPulse || now - pulseTick >= CooldownMs))
++        {
++            pulseTick = now;
++            pulsing = hasPulse = triggered = true;
++        }
++        if (!pulsing) return 0;
++        // Alternating pulse, not an invented push away from a guessed wall side.
++        const double phase = 2 * std::numbers::pi * double(now - pulseTick) / double(DurationMs);
++        return LONG(std::sin(phase) * std::clamp(strength, 0.0f, MaxStrength) * DI_FFNOMINALMAX);
++    }
++};
++
++// Reuse the Xbox surface lookup supplied by the game integration; the callback
++// also lets the hardware-free check exercise all four contact masks.
++inline float SurfaceRoughness(const std::array<uint32_t, 4>& masks, int loadType,
++    double (__cdecl* lookup)(unsigned int, int, DWORD*), DWORD* waterResult = nullptr)
++{
++    if (waterResult) *waterResult = 0; // Unknown contact never exposes a partial water result.
++    if (!lookup) return -1;
++    float roughness = -1; // No valid contact is not a smooth-road sample.
++    DWORD water = 0;
++    for (const auto mask : masks)
++    {
++        if (!mask) continue;
++        // ponytail: only single-bit contact IDs; validate composite IDs from logs before supporting them.
++        if (mask > 0x800000 || !std::has_single_bit(mask)) return -1;
++        const float value = float(lookup(mask, loadType, &water));
++        if (!std::isfinite(value) || value < 0 || value > 1) return -1;
++        roughness = (std::max)(roughness, value);
++    }
++    if (waterResult && roughness >= 0) *waterResult = water;
++    return roughness;
++}
++
++// P0 observation only. No driver, allocation, formatting or file I/O here.
++namespace Probe
++{
++constexpr size_t Capacity = 4096;
++constexpr uint64_t MaxDurationMs = 30000;
++enum class Stop : unsigned { None, Operator, Deadline, Full, Shutdown, Clock };
++struct Sample
++{
++    uint64_t tick = 0, timeUs = 0, inputTick = 0;
++    uint32_t player = 0, carId = 0, marker = 0;
++    int mode = -1, pauseMenu = -1;
++    bool focus = false, overlay = false, binding = false, connected = false, inputFresh = false;
++    float steer = 0;
++    int accel = 0, brake = 0;
++    uint32_t gear = 0, flags4 = 0, flags8 = 0;
++    // Raw offsets, deliberately not renamed as lateral motion/slip/crash state.
++    std::array<float, 7> raw{}; // 178, 1C4, 1D0, 1D4, 264, 268, 2F8
++    uint32_t raw281 = 0;
++    std::array<uint32_t, 4> surfaces{};
++    uint32_t stage = 0, loadType = 0;
++    int stageUnique = -1;
++    float roughness = -1;
++    uint32_t water = 0;
++    bool finite = false, surfaceValid = false;
++    uint64_t captureUs = 0;
++};
++struct Capture
++{
++    // ponytail: one <=30s capture per process; restart for another case. A crash
++    // loses the buffer; add recovery only after separately approved investigation.
++    std::array<Sample, Capacity> samples{};
++    size_t count = 0;
++    uint64_t startTick = 0, durationMs = 0;
++    Stop reason = Stop::None;
++    bool started = false;
++
++    bool running() const { return started && reason == Stop::None; }
++    bool start(uint64_t now, uint64_t duration)
++    {
++        if (started || duration < 1000 || duration > MaxDurationMs) return false;
++        startTick = now; durationMs = duration; started = true;
++        return true;
++    }
++    void stop(Stop why) { if (running() && why != Stop::None) reason = why; }
++    void poll(uint64_t now)
++    {
++        if (!running()) return;
++        if (now < startTick) stop(Stop::Clock);
++        else if (now - startTick >= durationMs) stop(Stop::Deadline);
++    }
++    bool push(const Sample& sample)
++    {
++        poll(sample.tick);
++        if (!running()) return false;
++        samples[count++] = sample;
++        if (count == Capacity) stop(Stop::Full); // No overwrite/wrap; capacity truncation explicit.
++        return true;
++    }
++    bool canFlush(bool inhibited, bool knownNonRacing) const
++    {
++        return started && !running() && inhibited && knownNonRacing;
++    }
++};
++
++// Stable numeric CSV, shared by the real flush path and synthetic/replay checks.
++// Called only AFTER stopping in a known non-racing state. No addresses/paths.
++inline void WriteCapture(std::ostream& out, const Capture& capture)
++{
++    out.imbue(std::locale::classic());
++    out << std::setprecision(9);
++    out << "# native-ffb-p0-v1 count=" << capture.count << " capacity=" << Capacity
++        << " stop=" << unsigned(capture.reason) << " start_tick=" << capture.startTick
++        << " duration_ms=" << capture.durationMs << " simulation_tick=unknown\n";
++    out << "seq,tick,time_us,input_tick,player,car_id,case,mode,pause_menu,focus,overlay,binding,pad,input_fresh,steer,accel,brake,gear,flags4,flags8,raw178,raw1C4,raw1D0,raw1D4,raw264,raw268,raw2F8,raw281,surface0,surface1,surface2,surface3,stage,load_type,stage_unique,roughness,water,finite,surface_valid,capture_us\n";
++    for (size_t i = 0; i < capture.count; ++i)
++    {
++        const auto& s = capture.samples[i];
++        out << i + 1 << ',' << s.tick << ',' << s.timeUs << ',' << s.inputTick << ',' << s.player
++            << ',' << s.carId << ',' << s.marker << ',' << s.mode << ',' << s.pauseMenu << ',' << s.focus
++            << ',' << s.overlay << ',' << s.binding << ',' << s.connected << ',' << s.inputFresh
++            << ',' << s.steer << ',' << s.accel << ',' << s.brake << ',' << s.gear << ',' << s.flags4 << ',' << s.flags8;
++        for (auto value : s.raw) out << ',' << value;
++        out << ',' << s.raw281;
++        for (auto mask : s.surfaces) out << ',' << mask;
++        out << ',' << s.stage << ',' << s.loadType << ',' << s.stageUnique << ',' << s.roughness
++            << ',' << s.water << ',' << s.finite << ',' << s.surfaceValid << ',' << s.captureUs << '\n';
++    }
++    out << "# end count=" << capture.count << '\n'; // Missing footer = incomplete write, not a passed capture.
++}
++}
++
++// Model input, NOT a verified game action flag. The isolated live trial below
++// supplies a provisional raw-word estimate; it does not measure tyre slip.
++enum class DriftStatus { Unknown, Grip, Drift };
++
++struct ExperimentalDriftEstimate
++{
++    static constexpr uint64_t EntryMs = 80, NeutralRearmMs = 200;
++    uint64_t tick = 0, pendingTick = 0;
++    bool started = false, ready = false, pending = false;
++    DriftStatus status = DriftStatus::Unknown;
++    void reset() { *this = {}; }
++
++    DriftStatus step(int rawD34, uint32_t flags4, uint32_t flags8, float speed,
++        bool valid, uint64_t now, int enter = 2000, int leave = 1000, float minimumSpeed = .1f)
++    {
++        // ponytail: raw magnitude + hysteresis, NOT a validated drift detector.
++        // Replace with a verified state reader after independent timed controls.
++        if (!valid || rawD34 < -32768 || rawD34 > 32767 || leave < 0 || enter <= leave || enter > 32767 ||
++            !std::isfinite(speed) || !std::isfinite(minimumSpeed) || minimumSpeed < .01f || minimumSpeed > 10 ||
++            speed < minimumSpeed || speed > 10 || (flags4 & 0x30000) || (flags8 & 0x40))
++        {
++            reset(); // Contact/unknown also requires neutral rearm, not merely a timeout.
++            return status;
++        }
++        if (!started || !Fresh(now, tick) || now - tick > 40)
++        {
++            reset();
++            started = true;
++            tick = now;
++            return status;
++        }
++        if (now == tick) return status; // No duplicate-time accumulation or new event.
++        tick = now;
++        const int magnitude = std::abs(rawD34); // Promoted int: -32768 is safe.
++        if (!ready)
++        {
++            if (magnitude > leave) pending = false;
++            else
++            {
++                if (!pending) { pending = true; pendingTick = now; }
++                if (now - pendingTick >= NeutralRearmMs)
++                {
++                    ready = true; pending = false;
++                    status = DriftStatus::Grip;
++                }
++            }
++            return status; // Attach/resume into an existing excursion stays UNKNOWN.
++        }
++        if (status == DriftStatus::Drift)
++        {
++            if (magnitude <= leave) status = DriftStatus::Grip;
++            return status;
++        }
++        if (magnitude < enter) pending = false;
++        else
++        {
++            if (!pending) { pending = true; pendingTick = now; }
++            if (now - pendingTick >= EntryMs) { status = DriftStatus::Drift; pending = false; }
++        }
++        return status;
++    }
++};
++
++struct RoadRumble
++{
++    uint64_t tick = 0;
++    double phase = 0;
++    float amplitude = 0;
++    float driftAmount = 0;
++    bool started = false;
++    static constexpr float DriftBlendMs = 100; // Trial entry/recovery time; not measured drift latency.
++
++    void reset() { *this = {}; }
++
++    LONG step(float speed, float roughness, float roadStrength, float offroadStrength,
++        float fullSpeed, uint64_t now, DriftStatus drift = DriftStatus::Unknown,
++        float driftDampingPercent = 0, float driftFrequency = 8)
++    {
++        if (!std::isfinite(speed) || speed <= 0.001f || speed > 10 ||
++            !std::isfinite(roughness) || roughness < 0 || roughness > 1 ||
++            !std::isfinite(roadStrength) || roadStrength < 0 ||
++            !std::isfinite(offroadStrength) || offroadStrength < 0 ||
++            (roadStrength == 0 && offroadStrength == 0) ||
++            !std::isfinite(fullSpeed) || fullSpeed < 0.05f || fullSpeed > 10)
++        {
++            reset();
++            return 0;
++        }
++        // Suppress undersampled continuous vibration rather than aliasing it
++        // into a one-sided pull. First sample after any gap starts at zero.
++        if (!started || !Fresh(now, tick) || now - tick > 40)
++        {
++            reset();
++            started = true;
++            tick = now;
++            return 0;
++        }
++        const auto elapsed = now - tick;
++        const float dt = float(elapsed) / 1000.0f;
++        tick = now;
++        const float speedGain = std::clamp(speed / fullSpeed, 0.0f, 1.0f);
++        const float surfaceGain = std::clamp(roughness / 0.9f, 0.0f, 1.0f);
++        float strength = std::lerp(std::clamp(roadStrength, 0.0f, MaxStrength),
++            std::clamp(offroadStrength, 0.0f, MaxStrength), surfaceGain);
++        double frequency = 6.0 + 4.0 * speedGain;
++        const bool modifierEnabled = std::isfinite(driftDampingPercent) && driftDampingPercent > 0 && driftDampingPercent <= 100 &&
++            std::isfinite(driftFrequency) && driftFrequency >= 6 && driftFrequency <= 10;
++        if (modifierEnabled)
++        {
++            // Unknown (including collision-contaminated status) returns to neutral
++            // without a recovery kick. Global stops still reset everything immediately.
++            const float targetAmount = drift == DriftStatus::Drift ? 1.0f : 0.0f;
++            const float amountStep = float(elapsed) / DriftBlendMs;
++            driftAmount += std::clamp(targetAmount - driftAmount, -amountStep, amountStep);
++        }
++        else driftAmount = 0; // Disabled/invalid settings never poison the legacy road path.
++        if (driftAmount > 0)
++        {
++            // True percent reduction independent of either road endpoint. Never
++            // amplify/reverse; zero endpoints and the surface/speed ratio survive.
++            strength *= 1.0f - (driftDampingPercent / 100.0f) * driftAmount;
++            frequency = std::lerp(frequency, double(driftFrequency), double(driftAmount));
++        }
++        const float target = strength * speedGain * DI_FFNOMINALMAX;
++        const float slew = 5000.0f * (std::min)(dt, 0.02f);
++        amplitude += std::clamp(target - amplitude, -slew, slew);
++        // Lowering a configured strength never leaves a stronger residual.
++        amplitude = (std::min)(amplitude, strength * DI_FFNOMINALMAX);
++        // ponytail: 6-10 Hz software rumble, >=25 Hz updates required; use hardware periodics for higher frequencies/low FPS.
++        phase = std::fmod(phase + frequency * dt, 1.0);
++        return LONG(std::sin(2 * std::numbers::pi * phase) * amplitude);
++    }
++};
++
++inline LONG Mix(LONG centre, LONG shift, LONG road = 0, LONG collision = 0)
++{
++    return LONG(std::clamp<int64_t>(int64_t(centre) + shift + road + collision, -MaxForce, MaxForce));
++}
++
++// Dedicated output handle, never the SDL/game polling device. Explicit close only:
++// driver/COM calls in a static destructor would run under the DLL loader lock.
++// Effect descriptor pattern reviewed against d-b-c-e/OutRun2006Tweaks-FFB,
++// commit 15f64f29a29e1dbb748a49d16d21b995ba5de83e (MIT, Copyright (c) 2023 emoose;
++// see LICENSE.md). Infinite effects, background access and retry loops are not ported.
++class Device
++{
++    IDirectInputDevice8A* device = nullptr;
++    IDirectInputEffect* effect = nullptr;
++    bool acquired = false;
++    bool savedAutocentre = false;
++    DIPROPDWORD autocentre{};
++
++    static void remember(HRESULT& result, HRESULT next)
++    {
++        if (FAILED(next) && (SUCCEEDED(result) || result == DIERR_NOTACQUIRED || result == DIERR_INPUTLOST))
++            result = next;
++    }
++
++public:
++    Device() = default;
++    Device(const Device&) = delete;
++    Device& operator=(const Device&) = delete;
++    bool opened() const { return device != nullptr; }
++
++    HRESULT open(IDirectInput8A* di, HWND hwnd, int vendor, int product)
++    {
++        if (device || !di || !hwnd || vendor <= 0 || vendor > 65535 || product <= 0 || product > 65535)
++            return E_INVALIDARG;
++        struct Selection { DWORD product; GUID instance{}; unsigned count = 0; } selected{ DWORD(MAKELONG(vendor, product)) };
++        HRESULT hr = di->EnumDevices(DI8DEVCLASS_GAMECTRL,
++            [](LPCDIDEVICEINSTANCEA info, void* context) -> BOOL {
++                auto& s = *static_cast<Selection*>(context);
++                if (info->guidProduct.Data1 == s.product) { s.instance = info->guidInstance; ++s.count; }
++                return DIENUM_CONTINUE;
++            }, &selected, DIEDFL_ATTACHEDONLY);
++        if (FAILED(hr)) return hr;
++        // ponytail: unique VID/PID only; add instance-GUID selection if two identical wheels are needed.
++        if (selected.count != 1) return DIERR_DEVICENOTREG;
++        hr = di->CreateDevice(selected.instance, &device, nullptr);
++        if (FAILED(hr)) return hr;
++        DIDEVCAPS caps{ sizeof(caps) };
++        if (FAILED(hr = device->GetCapabilities(&caps))) return hr;
++        if (!(caps.dwFlags & DIDC_FORCEFEEDBACK)) return DIERR_UNSUPPORTED;
++        if (FAILED(hr = device->SetDataFormat(&c_dfDIJoystick2))) return hr;
++        if (FAILED(hr = device->SetCooperativeLevel(hwnd, DISCL_EXCLUSIVE | DISCL_FOREGROUND))) return hr;
++        DIDEVICEOBJECTINSTANCEA axis{ sizeof(axis) };
++        if (FAILED(hr = device->GetObjectInfo(&axis, DIJOFS_X, DIPH_BYOFFSET))) return hr;
++        if (!(axis.dwFlags & DIDOI_FFACTUATOR) || axis.guidType != GUID_XAxis) return DIERR_UNSUPPORTED;
++        DIEFFECTINFOA info{ sizeof(info) };
++        if (FAILED(hr = device->GetEffectInfo(&info, GUID_ConstantForce))) return hr;
++        if (!(info.dwStaticParams & DIEP_DURATION)) return DIERR_UNSUPPORTED;
++        autocentre = {};
++        autocentre.diph = { sizeof(autocentre), sizeof(DIPROPHEADER), 0, DIPH_DEVICE };
++        if (FAILED(hr = device->GetProperty(DIPROP_AUTOCENTER, &autocentre.diph))) return hr;
++        savedAutocentre = true;
++        auto off = autocentre;
++        off.dwData = DIPROPAUTOCENTER_OFF;
++        return device->SetProperty(DIPROP_AUTOCENTER, &off.diph); // Must be unacquired.
++    }
++
++    HRESULT submit(LONG magnitude)
++    {
++        if (!device) return DIERR_NOTINITIALIZED;
++        HRESULT hr;
++        if (!acquired)
++        {
++            if (FAILED(hr = device->Acquire())) return hr;
++            acquired = true;
++        }
++        if (!effect)
++        {
++            DWORD axis = DIJOFS_X;
++            LONG direction = DI_FFNOMINALMAX; // Explicit positive X; magnitude supplies the sign.
++            DICONSTANTFORCE zero{};
++            DIEFFECT desc{};
++            desc.dwSize = sizeof(desc);
++            desc.dwFlags = DIEFF_CARTESIAN | DIEFF_OBJECTOFFSETS;
++            desc.dwDuration = LeaseMs * 1000; // Device-side expiry even if the game thread hangs.
++            desc.dwGain = DI_FFNOMINALMAX;
++            desc.dwTriggerButton = DIEB_NOTRIGGER;
++            desc.cAxes = 1;
++            desc.rgdwAxes = &axis;
++            desc.rglDirection = &direction;
++            desc.cbTypeSpecificParams = sizeof(zero);
++            desc.lpvTypeSpecificParams = &zero;
++            if (FAILED(hr = device->CreateEffect(GUID_ConstantForce, &desc, &effect, nullptr))) return hr;
++            DIEFFECT actual{};
++            actual.dwSize = sizeof(actual);
++            if (FAILED(hr = effect->GetParameters(&actual, DIEP_DURATION))) return hr;
++            if (!actual.dwDuration || actual.dwDuration > desc.dwDuration) return DIERR_UNSUPPORTED;
++        }
++        if (!magnitude) return effect->Stop();
++        DICONSTANTFORCE force{ LimitOutput(magnitude) };
++        DIEFFECT desc{};
++        desc.dwSize = sizeof(desc);
++        desc.cbTypeSpecificParams = sizeof(force);
++        desc.lpvTypeSpecificParams = &force;
++        // Restart the finite lease on EVERY fresh sample, including unchanged forces.
++        return effect->SetParameters(&desc, DIEP_TYPESPECIFICPARAMS | DIEP_START);
++    }
++
++    HRESULT suspend()
++    {
++        HRESULT hr = S_OK;
++        if (effect)
++        {
++            remember(hr, effect->Stop());
++            effect->Release();
++            effect = nullptr;
++        }
++        if (acquired)
++        {
++            // Continue cleanup even if Stop fails (focus loss/disconnect).
++            remember(hr, device->SendForceFeedbackCommand(DISFFC_STOPALL));
++            remember(hr, device->Unacquire());
++            acquired = false;
++        }
++        return hr;
++    }
++
++    HRESULT close()
++    {
++        HRESULT hr = suspend();
++        if (device)
++        {
++            if (savedAutocentre)
++                remember(hr, device->SetProperty(DIPROP_AUTOCENTER, &autocentre.diph));
++            device->Release();
++            device = nullptr;
++        }
++        savedAutocentre = false;
++        return hr;
++    }
++};
++}
++
++// All callers are on the game/window thread. No driver calls from DLL detach.
++// Latched at startup; a probe session cannot re-enable force, rumble or LEDs.
++bool NativeFfb_ProbeSession();
++void NativeFfb_InputUpdated();
++void NativeFfb_Check();
++void NativeFfb_Stop(bool shutdown = false);
+diff --git a/src/native_rpm_leds.cpp b/src/native_rpm_leds.cpp
+new file mode 100644
+index 0000000..9ec2a11
+--- /dev/null
++++ b/src/native_rpm_leds.cpp
+@@ -0,0 +1,271 @@
++#define WIN32_LEAN_AND_MEAN
++#include <Windows.h>
++#include <SetupAPI.h>
++#include <TlHelp32.h>
++#include <process.h>
++#include <memory>
++#include <string>
++#include "input_manager.hpp"
++#include "native_rpm_leds.hpp"
++
++namespace Settings
++{
++    Setting<bool> NativeRpmLedsEnabled{ "RPM LEDs", "NativeRpmLedsEnabled", false,
++        "Native R3/ES RPM LEDs over exclusive serial, without Pit House. Requires restart. No force/configuration commands." };
++    Setting<int> NativeRpmLedsFirstRpm{ "RPM LEDs", "NativeRpmLedsFirstRpm", 4000,
++        "Dashboard RPM for the first LED. Must be below FullRpm; not a car-specific redline. Requires restart.", Range<int>{100, 19999} };
++    Setting<int> NativeRpmLedsFullRpm{ "RPM LEDs", "NativeRpmLedsFullRpm", 8000,
++        "Dashboard RPM for all ten LEDs. Remaining thresholds are evenly spaced. Requires restart.", Range<int>{101, 20000} };
++    Setting<bool> NativeRpmLedsDiagnostics{ "RPM LEDs", "NativeRpmLedsDiagnostics", false,
++        "Log dashboard RPM and requested LED mask once per second; not proof of physical output." };
++}
++
++namespace
++{
++    struct Shared
++    {
++        NativeRpmLeds::Mailbox mailbox;
++        std::atomic<DWORD> error{ERROR_SUCCESS};
++        std::atomic<unsigned> port{0};
++        std::atomic<bool> opened{false};
++        HANDLE stop = nullptr, thread = nullptr;
++        HWND hwnd = nullptr;
++    };
++    // ponytail: process-lifetime DLL, no unload API. Retain context if a broken
++    // serial driver ignores cancellation; never free memory still used by a worker.
++    Shared* state = nullptr;
++    bool initialized = false, exiting = false;
++    bool reportedOpen = false;
++    DWORD reportedError = ERROR_SUCCESS;
++    uint64_t inputTick = 0, logTick = 0;
++    int firstRpm = 4000, fullRpm = 8000;
++
++    struct Handle
++    {
++        HANDLE value = INVALID_HANDLE_VALUE;
++        ~Handle() { if (value != INVALID_HANDLE_VALUE && value) CloseHandle(value); }
++    };
++
++    // Fail closed if process enumeration fails. Never terminate Pit House or
++    // SimHub, nor try to share/steal their serial connection.
++    bool CompanionRunning()
++    {
++        Handle snapshot{CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)};
++        if (snapshot.value == INVALID_HANDLE_VALUE) return true;
++        PROCESSENTRY32W entry{};
++        entry.dwSize = sizeof(entry);
++        if (!Process32FirstW(snapshot.value, &entry)) return true;
++        do
++        {
++            if (!_wcsicmp(entry.szExeFile, L"MOZA Pit House.exe") || !_wcsicmp(entry.szExeFile, L"SimHub.exe")) return true;
++        } while (Process32NextW(snapshot.value, &entry));
++        return GetLastError() != ERROR_NO_MORE_FILES;
++    }
++
++    // Enumerate only present Ports-class R3 MI_00 interfaces. Never guess COM4,
++    // fall back to another serial device, or resolve an ambiguous pair of R3s.
++    unsigned FindPort()
++    {
++        constexpr GUID portsClass{0x4d36e978, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
++        const auto info = SetupDiGetClassDevsW(&portsClass, nullptr, nullptr, DIGCF_PRESENT);
++        if (info == INVALID_HANDLE_VALUE) return 0;
++        const std::unique_ptr<void, decltype(&SetupDiDestroyDeviceInfoList)> cleanup(info, SetupDiDestroyDeviceInfoList);
++        unsigned found = 0, matches = 0;
++        SP_DEVINFO_DATA device{};
++        device.cbSize = sizeof(device);
++        for (DWORD i = 0; ; ++i)
++        {
++            if (!SetupDiEnumDeviceInfo(info, i, &device))
++                return GetLastError() == ERROR_NO_MORE_ITEMS && matches == 1 ? found : 0;
++            wchar_t id[512]{};
++            if (!SetupDiGetDeviceInstanceIdW(info, &device, id, DWORD(std::size(id)), nullptr)) return 0;
++            constexpr wchar_t prefix[] = L"USB\\VID_346E&PID_0005&MI_00\\";
++            if (_wcsnicmp(id, prefix, std::size(prefix) - 1)) continue;
++            if (++matches != 1) return 0;
++            HKEY key = SetupDiOpenDevRegKey(info, &device, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE);
++            if (key == INVALID_HANDLE_VALUE) return 0;
++            wchar_t name[32]{};
++            DWORD bytes = sizeof(name);
++            const auto result = RegGetValueW(key, nullptr, L"PortName", RRF_RT_REG_SZ, nullptr, name, &bytes);
++            RegCloseKey(key);
++            if (result != ERROR_SUCCESS || wcsncmp(name, L"COM", 3)) return 0;
++            wchar_t* end = nullptr;
++            const auto number = wcstoul(name + 3, &end, 10);
++            if (end == name + 3 || *end || number == 0 || number > 65535) return 0;
++            found = unsigned(number);
++        }
++    }
++
++    DWORD Send(HANDLE serial, uint16_t mask)
++    {
++        const auto frame = NativeRpmLeds::Encode(mask);
++        DWORD sent = 0;
++        if (!WriteFile(serial, frame.bytes.data(), frame.size, &sent, nullptr)) return GetLastError();
++        return sent == frame.size ? ERROR_SUCCESS : ERROR_WRITE_FAULT;
++    }
++
++    unsigned __stdcall Worker(void* parameter)
++    {
++        auto& s = *static_cast<Shared*>(parameter);
++        try
++        {
++            if (CompanionRunning()) { s.error = ERROR_BUSY; return 0; }
++            const auto port = FindPort();
++            if (!port) { s.error = ERROR_NOT_FOUND; return 0; }
++            if (WaitForSingleObject(s.stop, 0) != WAIT_TIMEOUT) return 0;
++            const auto path = L"\\\\.\\COM" + std::to_wstring(port);
++            Handle serial{CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr)};
++            if (serial.value == INVALID_HANDLE_VALUE) { s.error = GetLastError(); return 0; }
++            DCB dcb{};
++            dcb.DCBlength = sizeof(dcb);
++            if (!BuildCommDCBW(L"baud=115200 parity=N data=8 stop=1 dtr=off rts=off octs=off odsr=off xon=off", &dcb) ||
++                !SetCommState(serial.value, &dcb)) { s.error = GetLastError(); return 0; }
++            COMMTIMEOUTS timeouts{};
++            timeouts.WriteTotalTimeoutConstant = 100;
++            if (!SetCommTimeouts(serial.value, &timeouts)) { s.error = GetLastError(); return 0; }
++            s.port = port;
++            s.opened = true;
++            // All serial operations are on this worker, never the game/FFB thread.
++            // A stale publisher clears after 250ms even if the game thread hangs.
++            while (WaitForSingleObject(s.stop, 0) == WAIT_TIMEOUT)
++            {
++                const bool foreground = GetForegroundWindow() == s.hwnd && !IsIconic(s.hwnd);
++                const auto mask = s.mailbox.read(GetTickCount64(), foreground);
++                const auto error = Send(serial.value, mask);
++                if (error != ERROR_SUCCESS) { s.error = error; break; }
++                if (WaitForSingleObject(s.stop, 33) != WAIT_TIMEOUT) break;
++            }
++            // Best effort only: driver/device failure can prevent zero reaching
++            // the LEDs. No retries of nonzero output, no automatic reconnect.
++            for (int i = 0; i < 3; ++i)
++            {
++                const auto error = Send(serial.value, 0);
++                if (error != ERROR_SUCCESS) { s.error = error; break; }
++                Sleep(10);
++            }
++            s.opened = false;
++        }
++        catch (...) { s.error = ERROR_UNHANDLED_EXCEPTION; }
++        return 0;
++    }
++
++    bool Allowed()
++    {
++        return state && !exiting && Settings::NativeRpmLedsEnabled && Settings::UseNewInput &&
++            NativeRpmLeds::Fresh(GetTickCount64(), inputTick) && Game::current_mode && *Game::current_mode == STATE_GAME &&
++            GetForegroundWindow() == state->hwnd && !IsIconic(state->hwnd) &&
++            !Overlay::IsActive && !Overlay::IsBindingDialogActive && isListeningForInput == ListenState::False;
++    }
++}
++
++static void NativeRpmLeds_Init()
++{
++    if (initialized || exiting) return;
++    initialized = true;
++    if (!Settings::NativeRpmLedsEnabled || NativeFfb_ProbeSession()) return; // P0 must not start a worker/open serial.
++    firstRpm = Settings::NativeRpmLedsFirstRpm;
++    fullRpm = Settings::NativeRpmLedsFullRpm;
++    if (!NativeRpmLeds::ValidRange(firstRpm, fullRpm) || !Game::GameHwnd())
++    {
++        spdlog::error("Native RPM LEDs: invalid RPM range/window; disabled for this session");
++        return;
++    }
++    try
++    {
++        state = new Shared;
++        state->hwnd = Game::GameHwnd();
++        state->stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++        if (!state->stop) { state->error = GetLastError(); return; }
++        state->thread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, Worker, state, 0, nullptr));
++        if (!state->thread)
++        {
++            state->error = ERROR_NOT_ENOUGH_MEMORY;
++            CloseHandle(state->stop);
++            state->stop = nullptr;
++        }
++        else spdlog::info("Native RPM LEDs: starting R3/ES worker; first={} full={}; Pit House must remain closed", firstRpm, fullRpm);
++    }
++    catch (...) { spdlog::error("Native RPM LEDs: startup failed; input and FFB unchanged"); }
++}
++
++void NativeRpmLeds_InputUpdated()
++{
++    // First real input tick: the game window is fully initialized by now.
++    if (!initialized && !exiting) NativeRpmLeds_Init();
++    if (!state || exiting) return;
++    auto* pad = InputManager::instance.getPrimaryGamepad();
++    const bool connected = pad && SDL_GamepadConnected(pad) && SDL_GetGamepadVendor(pad) == 0x346e && SDL_GetGamepadProduct(pad) == 5;
++    inputTick = connected ? GetTickCount64() : 0;
++    NativeRpmLeds_Check();
++}
++
++void NativeRpmLeds_Update(EVWORK_CAR* car)
++{
++    if (!state || exiting) return;
++    if (!Allowed()) { state->mailbox.clear(); return; }
++    if (!car || car != Game::pl_car()) return;
++    static_assert(offsetof(EVWORK_CAR, dword20C) == 0x20c);
++    const auto rpm = car->dword20C; // Actual smoothed dashboard RPM, not speed/gear synthesis.
++    const auto now = GetTickCount64();
++    const auto mask = NativeRpmLeds::Mask(rpm, firstRpm, fullRpm);
++    state->mailbox.publish(mask, now);
++    if (Settings::NativeRpmLedsDiagnostics && now - logTick >= 1000)
++    {
++        logTick = now;
++        spdlog::info("Native RPM LEDs: dashboardRPM={} requestedMask=0x{:03X}", rpm, mask);
++    }
++}
++
++void NativeRpmLeds_Check()
++{
++    if (!state || exiting) return;
++    if (!Allowed()) state->mailbox.clear();
++    if (state->opened.load() && !reportedOpen)
++    {
++        reportedOpen = true;
++        spdlog::info("Native RPM LEDs: exclusive COM{} opened; legacy LED-only output", state->port.load());
++    }
++    const auto error = state->error.load();
++    if (error != ERROR_SUCCESS && error != reportedError)
++    {
++        reportedError = error;
++        spdlog::error("Native RPM LEDs: disabled until restart, Win32 error={} (170: close Pit House/SimHub; 1168: no unique R3 port). Input/FFB unchanged", error);
++    }
++}
++
++void NativeRpmLeds_Stop(bool shutdown)
++{
++    if (state) state->mailbox.clear();
++    inputTick = 0;
++    if (!shutdown || exiting) return;
++    exiting = true;
++    if (!state || !state->thread) return;
++    SetEvent(state->stop);
++    if (WaitForSingleObject(state->thread, 1000) == WAIT_OBJECT_0)
++    {
++        CloseHandle(state->thread); state->thread = nullptr;
++        CloseHandle(state->stop); state->stop = nullptr;
++        spdlog::info("Native RPM LEDs: worker stopped, final clearing attempted; error={}", state->error.load());
++    }
++    else
++    {
++        CancelSynchronousIo(state->thread);
++        spdlog::warn("Native RPM LEDs: driver did not stop within 1s; cancellation requested, context retained until process exit");
++    }
++}
++
++class NativeRpmLedSettings : public Hook
++{
++public:
++    std::string_view description() override { return "Native RPM LEDs"; }
++    void declare_settings() override
++    {
++        Settings::NativeRpmLedsEnabled.needs_restart();
++        Settings::NativeRpmLedsFirstRpm.needs_restart();
++        Settings::NativeRpmLedsFullRpm.needs_restart();
++    }
++    bool validate() override { return false; } // Settings only; reuse existing hooks.
++    bool apply() override { return true; }
++    static NativeRpmLedSettings instance;
++};
++NativeRpmLedSettings NativeRpmLedSettings::instance;
+diff --git a/src/native_rpm_leds.hpp b/src/native_rpm_leds.hpp
+new file mode 100644
+index 0000000..d455d99
+--- /dev/null
++++ b/src/native_rpm_leds.hpp
+@@ -0,0 +1,83 @@
++#pragma once
++#include <array>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++
++// R3 + ES only. Legacy runtime LED frames, not wheel configuration commands.
++// Protocol reference: francisdb/moza-rev, 6a3cf66c734dde29126e6d9b296adeab4479d005.
++// Independently encoded from the wire format; validated by the local LED-only test.
++namespace NativeRpmLeds
++{
++    constexpr uint64_t StaleMs = 250;
++    constexpr uint32_t MaxRpm = 20000;
++    constexpr uint16_t FullMask = 1023;
++
++    inline bool ValidRange(int first, int full)
++    {
++        return first >= 100 && first < full && full <= int(MaxRpm);
++    }
++
++    inline uint16_t Mask(uint32_t rpm, int first, int full)
++    {
++        if (!ValidRange(first, full) || rpm > MaxRpm || rpm < uint32_t(first)) return 0;
++        if (rpm >= uint32_t(full)) return FullMask;
++        const auto count = 1 + (rpm - uint32_t(first)) * 9 / uint32_t(full - first);
++        return uint16_t((1u << count) - 1);
++    }
++
++    struct Frame
++    {
++        std::array<uint8_t, 20> bytes{};
++        uint32_t size = 0;
++    };
++
++    inline Frame Encode(uint16_t mask)
++    {
++        if (mask > FullMask) throw std::invalid_argument("R3 LED mask outside 0..1023");
++        Frame frame;
++        frame.bytes[frame.size++] = 0x7e;
++        frame.bytes[frame.size++] = 6;
++        unsigned checksum = 0x0d + 0x7e + 6;
++        const uint8_t body[] = { 0x41, 0x13, 0xfd, 0xde, 0, 0, uint8_t(mask >> 8), uint8_t(mask) };
++        for (const auto b : body)
++        {
++            frame.bytes[frame.size++] = b;
++            checksum += b;
++            if (b == 0x7e) { frame.bytes[frame.size++] = b; checksum += b; }
++        }
++        const auto b = uint8_t(checksum);
++        frame.bytes[frame.size++] = b;
++        if (b == 0x7e) frame.bytes[frame.size++] = b;
++        return frame;
++    }
++
++    inline bool Fresh(uint64_t now, uint64_t then)
++    {
++        return then != 0 && now >= then && now - then < StaleMs;
++    }
++
++    // One atomic snapshot: no torn timestamp/mask on Win32. Worker never reads
++    // game memory or mutable settings. Zero invalidates the previous sample.
++    struct Mailbox
++    {
++        std::atomic<uint64_t> sample{0};
++        void clear() { sample.store(0); }
++        void publish(uint16_t mask, uint64_t now)
++        {
++            sample.store(mask <= FullMask && now < (uint64_t{1} << 48) ? (now << 16) | mask : 0);
++        }
++        uint16_t read(uint64_t now, bool foreground) const
++        {
++            const auto value = sample.load();
++            return foreground && Fresh(now, value >> 16) ? uint16_t(value & FullMask) : 0;
++        }
++    };
++}
++
++struct tagEVWORK_CAR;
++void NativeRpmLeds_InputUpdated();
++void NativeRpmLeds_Update(tagEVWORK_CAR* car);
++void NativeRpmLeds_Check();
++void NativeRpmLeds_Stop(bool shutdown = false);
+diff --git a/src/overlay/hooks_overlay.cpp b/src/overlay/hooks_overlay.cpp
+index d111961..b38d436 100644
+--- a/src/overlay/hooks_overlay.cpp
++++ b/src/overlay/hooks_overlay.cpp
+@@ -8,6 +8,8 @@
+ #include <backends/imgui_impl_win32.h>
+ #include <backends/imgui_impl_dx9.h>
+ #include "overlay.hpp"
++#include "native_ffb.hpp"
++#include "native_rpm_leds.hpp"
+ 
+ namespace Settings
+ {
+@@ -214,6 +216,10 @@ class D3DHooks : public Hook
+ 			ImGui::Render();
+ 			ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+ 		}
++		// Covers menus/pause even when the player's car hook no longer runs.
++		// A hung render thread is covered by the finite device-side effect lease.
++		NativeFfb_Check();
++		NativeRpmLeds_Check();
+ 	}
+ 
+ 	inline static SafetyHookMid midhook_d3dTemporariesRelease{};
+@@ -278,6 +284,7 @@ public:
+ D3DHooks D3DHooks::instance;
+ 
+ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
++void InputManager_Shutdown();
+ 
+ class WndprocHook : public Hook
+ {
+@@ -286,6 +293,18 @@ class WndprocHook : public Hook
+ 	inline static SafetyHookInline dest_orig = {};
+ 	static LRESULT __stdcall destination(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+ 	{
++		// Release SDL gamepads before window destruction / DLL detach, even if
++		// an overlay handler consumes the message. Shutdown is idempotent.
++		if (msg == WM_CLOSE || msg == WM_DESTROY || (msg == WM_ENDSESSION && wParam))
++			InputManager_Shutdown();
++
++		if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATEAPP && !wParam) ||
++			(msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE) || msg == WM_QUERYENDSESSION)
++		{
++			NativeFfb_Stop();
++			NativeRpmLeds_Stop();
++		}
++
+ 		if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
+ 			return 1;
+ 
+diff --git a/tests/combined_effects_test.cpp b/tests/combined_effects_test.cpp
+new file mode 100644
+index 0000000..6435b77
+--- /dev/null
++++ b/tests/combined_effects_test.cpp
+@@ -0,0 +1,80 @@
++// Hardware-free all-implemented-effects mix, including synthetic drift damping.
++#include "../src/contact_models.hpp"
++#include "../src/native_rpm_leds.hpp"
++#include <cassert>
++#include <iostream>
++using namespace NativeFfb;
++using namespace NativeFfb::Experimental;
++
++int main()
++{
++    static_assert(sizeof(void*) == 4 && DeviceMaxForce == 5000 && LeaseMs == 100);
++    unsigned totalClipped = 0;
++    for (uint64_t cadence : {16ull, 17ull, 33ull, 40ull})
++    for (bool invert : {false, true})
++    for (float steering : {-1.f, 1.f})
++    {
++        CentreForce centre;
++        ShiftJolt shift;
++        RoadRumble road;
++        ContactModels contacts;
++        NativeRpmLeds::Mailbox leds;
++        std::array<LONG, 7> lo{}, hi{};
++        unsigned clipped = 0, overlapping = 0;
++        const ContactSettings settings{.5f, .05f, .5f, .05f, 1};
++        for (uint64_t elapsed = 0; elapsed < 6000; elapsed += cadence)
++        {
++            const auto now = 1000 + elapsed;
++            const auto phase = elapsed % 2000;
++            const uint32_t flags = (phase >= 200 && phase < 600 ? TrafficBit : 0) |
++                (phase >= 1000 && phase < 1400 ? WallBit : 0) |
++                (phase >= 1600 && phase < 1800 ? WallBit | TrafficBit : 0);
++            const auto c = centre.step(steering, .1f, 0, .02f, invert, now);
++            const auto s = shift.step(2 + uint32_t((elapsed + 200) / 400 % 2), .3f, now);
++            const auto drift = flags ? DriftStatus::Unknown :
++                phase >= 650 && phase < 950 ? DriftStatus::Drift : DriftStatus::Grip;
++            if (drift == DriftStatus::Unknown) road.driftAmount = 0;
++            const auto r = road.step(1, elapsed / 1000 % 2 ? .9f : 0.f, .02f, .08f, 1, now, drift, 20);
++            if (flags) assert(road.driftAmount == 0);
++            const auto out = contacts.step(flags, 0x100, 1, settings, now);
++            const std::array<LONG, 7> values{c, s, r, out.barrier, out.traffic, out.barrierScrape, out.trafficScrape};
++            const std::array<LONG, 7> limits{1000, 3000, 800, 5000, 5000, 500, 500};
++            for (size_t i = 0; i < values.size(); ++i)
++            {
++                assert(std::abs(values[i]) <= limits[i]);
++                lo[i] = (std::min)(lo[i], values[i]); hi[i] = (std::max)(hi[i], values[i]);
++            }
++            assert(!out.barrier || !out.traffic); // One impact envelope, no stacking.
++            assert((flags & WallBit) || out.barrierScrape == 0);
++            assert((flags & TrafficBit) || out.trafficScrape == 0);
++            const int64_t accents = int64_t(s) + r + out.barrier + out.traffic + out.barrierScrape + out.trafficScrape;
++            const auto raw = out.sum(c, s, r, invert);
++            assert(raw == c + (invert ? -accents : accents));
++            const auto force = LimitOutput(raw);
++            assert(force == (raw < -5000 ? -5000 : raw > 5000 ? 5000 : raw));
++            clipped += raw != force;
++            overlapping += c != 0 && s != 0 && r != 0 && (out.barrier != 0 || out.traffic != 0);
++            // Numeric LED publication remains independent of the force mixer.
++            const auto mask = NativeRpmLeds::Mask(6000, 4000, 8000);
++            assert(mask != 0);
++            leds.publish(mask, now);
++            assert(leds.read(now, true) == mask && leds.read(now, false) == 0);
++        }
++        for (size_t i = 1; i < lo.size(); ++i) assert(lo[i] < 0 && hi[i] > 0);
++        assert(overlapping > 0);
++        totalClipped += clipped;
++        centre.reset(); shift.reset(); road.reset(); contacts.reset(); leds.clear();
++        assert(!centre.started && !shift.pulsing && !road.started && !contacts.barrier.started);
++        assert(!contacts.traffic.pulse.started && !contacts.barrierTexture.started && !contacts.trafficTexture.started);
++        assert(leds.read(8000, true) == 0);
++        assert(centre.step(steering, .1f, 0, .02f, invert, 8000) == 0);
++        assert(shift.step(3, .3f, 8000) == 0);
++        assert(road.step(1, .9f, .02f, .08f, 1, 8000) == 0);
++        const auto resumed = contacts.step(WallBit | TrafficBit, 0x100, 1, settings, 8000);
++        assert(resumed.sum(0, 0, 0) == 0 && !resumed.barrierTriggered && !resumed.trafficTriggered);
++        std::cout << "COMBINED cadence=" << cadence << " invert=" << invert << " steer=" << steering
++            << " overlapSamples=" << overlapping << " clippedSamples=" << clipped << '\n';
++    }
++    assert(totalClipped > 0); // Exercise actual saturation, not only in-range values.
++    std::cout << "PASS: all-effects plus 20% drift damping, actual model overlap/reset, LED mailbox, hard 50% cap; synthetic only, not hardware validation\n";
++}
+diff --git a/tests/contact_models_test.cpp b/tests/contact_models_test.cpp
+new file mode 100644
+index 0000000..9594b6e
+--- /dev/null
++++ b/tests/contact_models_test.cpp
+@@ -0,0 +1,253 @@
++// Offline numeric models only. No Device instances, game launch or hardware calls.
++#include "../src/contact_models.hpp"
++#include <cassert>
++#include <climits>
++#include <fstream>
++#include <iostream>
++#include <limits>
++#include <sstream>
++#include <string>
++#include <vector>
++using namespace NativeFfb;
++using namespace NativeFfb::Experimental;
++static_assert(sizeof(void*) == 4, "Use the Win32 MSVC toolchain for these baseline checks");
++
++static void synthetic()
++{
++    const float nan = std::numeric_limits<float>::quiet_NaN();
++    const float inf = std::numeric_limits<float>::infinity();
++    for (uint64_t cadence : {1ull, 16ull, 17ull, 33ull, 40ull})
++    {
++        ContactTexture texture;
++        LONG lo = 0, hi = 0;
++        for (uint64_t now = 0; now <= 3000; now += cadence)
++        {
++            const LONG value = texture.step(Contact::Present, 1, .05f, 1, now);
++            lo = (std::min)(lo, value); hi = (std::max)(hi, value);
++            assert(std::abs(value) <= 500);
++            assert(texture.amplitude <= 500 * (std::min)(1.f, float(now) / 60) + .001f);
++            if (now == 0) assert(value == 0);
++        }
++        assert(lo < -400 && hi > 400 && texture.amplitude == 500);
++        const auto next = texture.tick + cadence;
++        const auto phase = texture.phase;
++        assert(texture.step(Contact::Absent, 1, .05f, 1, next) == 0 && texture.amplitude == 0);
++        assert(std::abs(texture.phase - std::fmod(phase + 8 * double(cadence) / 1000, 1.0)) < 1e-10);
++        assert(texture.step(Contact::Present, 1, .05f, 1, next + cadence) == 0); // Fresh edge starts at zero.
++        texture.step(Contact::Present, 1, .05f, 1, next + 2 * cadence);
++        assert(texture.amplitude > 0);
++        assert(texture.step(Contact::Unknown, 1, .05f, 1, next + 3 * cadence) == 0 && !texture.started);
++    }
++    ContactTexture t;
++    auto prime = [&] {
++        t.reset(); t.step(Contact::Present, 1, .5f, 1, 0);
++        t.step(Contact::Present, 1, .5f, 1, 20);
++        assert(t.amplitude > 0);
++    };
++    for (uint64_t gap : {41ull, 99ull, 100ull, 1000ull})
++    {
++        prime(); assert(t.step(Contact::Present, 1, .5f, 1, 20 + gap) == 0 && t.amplitude == 0);
++    }
++    prime(); t.step(Contact::Present, 1, .5f, 1, 60); assert(t.amplitude == 5000); // Exactly 40ms valid.
++    prime(); assert(t.step(Contact::Present, 1, .5f, 1, 20) == 0 && !t.started); // Duplicate.
++    prime(); assert(t.step(Contact::Present, 1, .5f, 1, 19) == 0 && t.amplitude == 0); // Backward.
++    for (float speed : {0.f, .001f, -1.f, 11.f, nan, inf})
++    { prime(); assert(t.step(Contact::Present, speed, .5f, 1, 40) == 0 && !t.started); }
++    for (float strength : {0.f, -1.f, nan, inf})
++    { prime(); assert(t.step(Contact::Present, 1, strength, 1, 40) == 0 && !t.started); }
++    for (float fullSpeed : {0.f, .049f, 10.1f, nan, inf})
++    { prime(); assert(t.step(Contact::Present, 1, .5f, fullSpeed, 40) == 0 && !t.started); }
++    prime(); assert(t.step(Contact(99), 1, .5f, 1, 40) == 0 && !t.started);
++    prime(); t.step(Contact::Present, 1, .001f, 1, 40); assert(t.amplitude <= 10); // Lower cap immediate.
++    prime(); t.step(Contact::Present, .01f, .5f, 1, 40); assert(t.amplitude <= 50); // Speed drop cap immediate.
++    for (float fullSpeed : {.05f, 1.f, 2.f, 10.f})
++    {
++        t.reset();
++        for (uint64_t now = 0; now <= 120; now += 10) t.step(Contact::Present, 1, 2, fullSpeed, now);
++        assert(std::abs(t.amplitude - 10000 * (std::min)(1.f, 1 / fullSpeed)) < .01f);
++    }
++    // Irregular cadence and contact flicker: absent samples always zero, phase remains time-based.
++    t.reset();
++    uint64_t now = 0;
++    for (unsigned i = 0; i < 500; ++i)
++    {
++        now += i % 3 == 0 ? 33 : 16;
++        const bool contact = i % 5 != 0;
++        const auto value = t.step(contact ? Contact::Present : Contact::Absent, 1, .05f, 1, now);
++        if (!contact) assert(value == 0 && t.amplitude == 0);
++        assert(std::abs(value) <= 500);
++    }
++
++    TrafficJolt traffic;
++    traffic.step(0, 1, .5f, 0);
++    assert(traffic.step(TrafficBit, 1, .5f, 10) == 0 && traffic.pulse.triggered);
++    assert(traffic.step(0, 1, .5f, 40) == 5000); // One-sample hit continues its envelope.
++    traffic.step(0, 1, .5f, 70);
++    assert(traffic.step(0, 1, .5f, 100) == -5000);
++    assert(traffic.step(0, 1, .5f, 130) == 0);
++    assert(!traffic.pulse.pulsing);
++    traffic.reset();
++    traffic.step(TrafficBit, 1, .5f, 0); // Attach on held contact must not kick.
++    for (now = 10; now <= 1000; now += 10)
++        assert(traffic.step(TrafficBit, 1, .5f, now) == 0 && !traffic.pulse.triggered);
++    traffic.step(0, 1, .5f, 1010);
++    traffic.step(TrafficBit, 1, .5f, 1020); assert(traffic.pulse.triggered);
++    traffic.step(TrafficBit, 1, .5f, 1020); assert(!traffic.pulse.started); // Duplicate invalidates.
++    traffic.step(TrafficBit, 1, .5f, 1030); assert(!traffic.pulse.triggered);
++    traffic.step(0, 1, .5f, 1040);
++    traffic.step(TrafficBit, 1, .5f, 1081); assert(!traffic.pulse.triggered); // Gap primes.
++    traffic.step(0, 1, .5f, 1080); assert(!traffic.pulse.triggered); // Backward.
++    for (float strength : {0.f, -1.f, nan, inf})
++        assert(traffic.step(TrafficBit, 1, strength, 1100) == 0 && !traffic.pulse.started);
++
++    ContactModels disabled;
++    for (now = 0; now <= 1000; now += 10)
++    {
++        const auto silent = disabled.step(WallBit | TrafficBit, 0x100, 1, ContactSettings{}, now);
++        assert(silent.mix(0, 0, 0) == 0 && !silent.barrierTriggered && !silent.trafficTriggered);
++        assert(!disabled.barrier.started && !disabled.traffic.pulse.started &&
++            !disabled.barrierTexture.started && !disabled.trafficTexture.started);
++    }
++    ContactSettings trafficOnly{0, 0, .5f, 0, 1};
++    disabled.step(0, 0, 1, trafficOnly, 1010);
++    auto trafficOut = disabled.step(WallBit | TrafficBit, 0x100, 1, trafficOnly, 1020);
++    assert(trafficOut.trafficTriggered && !trafficOut.barrierTriggered && !trafficOut.trafficSuppressed);
++
++    ContactSettings settings{.5f, .05f, .5f, .05f, 1};
++    ContactModels models;
++    models.step(0, 0, 1, settings, 0);
++    auto out = models.step(WallBit | TrafficBit, 0x100, 1, settings, 10);
++    assert(out.barrierTriggered && out.trafficSuppressed && !out.trafficTriggered);
++    for (now = 20; now <= 600; now += 10)
++    {
++        out = models.step(WallBit | TrafficBit, 0x100, 1, settings, now);
++        assert(!out.barrierTriggered && !out.trafficTriggered && out.traffic == 0);
++    }
++    models.step(0, 0, 1, settings, 610);
++    out = models.step(TrafficBit, 0, 1, settings, 620); assert(out.trafficTriggered); // Genuine fresh edge after cooldown.
++    out = models.step(TrafficBit | WallBit, 0x100, 1, settings, 630);
++    assert(out.barrierSuppressed && !out.barrierTriggered && out.traffic != 0);
++    for (now = 640; now <= 800; now += 10)
++    { out = models.step(0, 0, 1, settings, now); assert(!out.barrierTriggered && !out.trafficTriggered && out.barrier == 0); }
++    out = models.step(TrafficBit, 0, 1, settings, 810); assert(!out.trafficTriggered); // 500ms cooldown, not queued.
++    for (now = 820; now <= 1110; now += 10) models.step(0, 0, 1, settings, now);
++    out = models.step(TrafficBit, 0, 1, settings, 1120); assert(out.trafficTriggered); // Exactly 500ms.
++    out = models.step(TrafficBit, 0, 1, settings, 1130, false);
++    assert(out.mix(0, 0, 0) == 0 && !models.barrier.started && !models.traffic.pulse.started);
++    assert(!models.trafficTexture.started && !models.barrierTexture.started);
++    out = models.step(TrafficBit, 0, 1, settings, 1140);
++    assert(!out.trafficTriggered && out.trafficScrape == 0);
++    models.reset(); assert(!models.trafficTexture.started);
++
++    // Neutral options must preserve the exact legacy call path, including duplicates/gaps.
++    ContactModels neutral;
++    CollisionJolt legacy;
++    CentreForce centre;
++    ShiftJolt shift;
++    RoadRumble road;
++    uint32_t rng = 7;
++    now = 1000;
++    for (unsigned i = 0; i < 5000; ++i)
++    {
++        rng = rng * 1664525u + 1013904223u;
++        now += std::array<uint64_t, 7>{0, 16, 17, 33, 40, 41, 100}[rng % 7];
++        const uint32_t flags4 = (rng & 1 ? WallBit : 0) | (rng & 2 ? TrafficBit : 0);
++        const uint32_t flags8 = rng & 4 ? 0x100 : 0x800;
++        const float speed = rng & 8 ? 1.f : 0.f;
++        const bool reset = i % 67 == 0;
++        if (reset) { neutral.reset(); legacy.reset(); centre.reset(); shift.reset(); road.reset(); }
++        const auto value = legacy.step(flags4, flags8, speed, .5f, now);
++        out = neutral.step(flags4, flags8, speed, ContactSettings{.5f}, now);
++        assert(out.barrier == value && out.barrierTriggered == legacy.triggered);
++        assert(out.traffic == 0 && out.barrierScrape == 0 && out.trafficScrape == 0);
++        const auto c = centre.step((rng & 16) ? .5f : -.5f, .1f, 0, .02f, false, now);
++        const auto s = shift.step(2 + (rng & 1), .05f, now);
++        const auto r = road.step(speed, .5f, .01f, .05f, 1, now);
++        assert(out.mix(c, s, r) == Mix(c, s, r, value));
++        assert(out.mix(c, s, r, true) == Mix(c, -s, -r, -value));
++    }
++    out = {LONG_MAX, LONG_MAX, LONG_MAX, LONG_MAX};
++    assert(out.mix(LONG_MAX, LONG_MAX, LONG_MAX) == MaxForce);
++    assert(out.mix(0, LONG_MAX, LONG_MAX, true) == -MaxForce);
++    out = {LONG_MIN, LONG_MIN, LONG_MIN, LONG_MIN};
++    assert(out.mix(LONG_MIN, LONG_MIN, LONG_MIN) == -MaxForce);
++    assert(out.mix(0, LONG_MIN, LONG_MIN, true) == MaxForce);
++    out = {100, -200, 30, 40};
++    assert(out.mix(300, 50, -10) == 310 && out.mix(300, 50, -10, true) == 290);
++    std::cout << "PASS: contact models, neutral legacy equivalence, timing/numeric/reset gates, arbitration and one-clamp mix (offline only)\n";
++}
++
++static void replay(const char* path)
++{
++    std::ifstream file(path); assert(file.is_open());
++    std::string line;
++    assert(std::getline(file, line) && line == "case_id,seq,tick_ms,flags4,flags8,speed,valid,reset");
++    ContactModels combined, neutral;
++    CollisionJolt legacy;
++    TrafficJolt soloTraffic;
++    unsigned previousCase = 0, previousSeq = 0, count = 0;
++    uint64_t previousTick = 0;
++    while (std::getline(file, line))
++    {
++        assert(line.size() < 256 && ++count <= 100000);
++        std::replace(line.begin(), line.end(), ',', ' ');
++        std::istringstream row(line);
++        unsigned id, seq, valid, reset;
++        uint64_t tick, flags4, flags8;
++        float speed;
++        assert(row >> id >> seq >> tick >> flags4 >> flags8 >> speed >> valid >> reset);
++        row >> std::ws; assert(row.eof());
++        assert(valid <= 1 && reset <= 1 && std::isfinite(speed) && std::abs(speed) <= 10);
++        assert(id >= 1 && id <= 100 && tick <= 30000 && flags4 <= UINT32_MAX && flags8 <= UINT32_MAX);
++        if (id != previousCase) { assert(id == previousCase + 1 && reset && seq == 1); previousSeq = 0; }
++        assert(seq == previousSeq + 1);
++        if (reset || id != previousCase)
++        { combined.reset(); neutral.reset(); legacy.reset(); soloTraffic.reset(); }
++        ContactOutput out, old;
++        LONG solo = 0;
++        // Match P0's conservative replay history policy, without changing the legacy class.
++        if (!valid || (id == previousCase && tick <= previousTick))
++        { combined.reset(); neutral.reset(); legacy.reset(); soloTraffic.reset(); }
++        else
++        {
++            const auto f4 = uint32_t(flags4), f8 = uint32_t(flags8);
++            const auto legacyForce = legacy.step(f4, f8, speed, .5f, tick);
++            old = neutral.step(f4, f8, speed, ContactSettings{.5f}, tick);
++            assert(old.barrier == legacyForce && old.barrierTriggered == legacy.triggered);
++            assert(old.mix(123, -70, 21) == Mix(123, -70, 21, legacyForce));
++            solo = soloTraffic.step(f4, speed, .5f, tick);
++            out = combined.step(f4, f8, speed, ContactSettings{.5f, .05f, .5f, .05f, 1}, tick);
++        }
++        assert(std::abs(out.barrier) <= 5000 && std::abs(out.traffic) <= 5000 && std::abs(solo) <= 5000);
++        assert(std::abs(out.barrierScrape) <= 500 && std::abs(out.trafficScrape) <= 500);
++        assert((flags4 & WallBit) || out.barrierScrape == 0);
++        assert((flags4 & TrafficBit) || out.trafficScrape == 0);
++        // Actual live boundary: centre already inverted, accents inverted once,
++        // then hard trial cap. Test both full 10% centre extremes on every sample.
++        for (LONG centre : {-1000L, 0L, 1000L})
++            for (bool invert : {false, true})
++                assert(std::abs(LimitOutput(out.sum(centre, 0, 0, invert))) <= DeviceMaxForce);
++        assert(speed > .001f || (out.barrierScrape == 0 && out.trafficScrape == 0));
++        if (old.barrierTriggered) std::cout << "EDGE," << id << ",legacy," << seq << '\n';
++        if (soloTraffic.pulse.triggered) std::cout << "EDGE," << id << ",traffic_candidate," << seq << '\n';
++        if (out.barrierTriggered) std::cout << "EDGE," << id << ",barrier_granted," << seq << '\n';
++        if (out.trafficTriggered) std::cout << "EDGE," << id << ",traffic_granted," << seq << '\n';
++        if (out.barrierSuppressed) std::cout << "EDGE," << id << ",barrier_suppressed," << seq << '\n';
++        if (out.trafficSuppressed) std::cout << "EDGE," << id << ",traffic_suppressed," << seq << '\n';
++        std::cout << "ROW," << id << ',' << seq << ',' << out.barrier << ',' << out.traffic << ','
++            << out.barrierScrape << ',' << out.trafficScrape << ',' << out.mix(0, 0, 0) << ',' << out.sum(0, 0, 0) << '\n';
++        std::cout << "TRIAL," << id << ',' << seq << ',' << LimitOutput(out.sum(0, 0, 0)) << '\n';
++        previousCase = id; previousSeq = seq; previousTick = tick;
++    }
++    assert(file.eof() && count);
++    std::cout << "PASS: " << count << " observed samples through actual C++ models; candidate edges are NOT verified physical impacts\n";
++}
++
++int main(int argc, char** argv)
++{
++    assert(argc == 1 || argc == 2);
++    // Windows exception-style negative status must fail the .cmd runner too.
++    if (argc == 2 && std::string(argv[1]) == "--self-fail") return -1073740791;
++    synthetic();
++    if (argc == 2) replay(argv[1]);
++}
+diff --git a/tests/drift_feedback_test.cpp b/tests/drift_feedback_test.cpp
+new file mode 100644
+index 0000000..e1a1abf
+--- /dev/null
++++ b/tests/drift_feedback_test.cpp
+@@ -0,0 +1,114 @@
++// Synthetic model tests only: no game/device calls or observed private captures.
++#include "../src/native_ffb.hpp"
++#include "legacy_road.hpp"
++#include <cassert>
++#include <iostream>
++#include <limits>
++using namespace NativeFfb;
++
++int main()
++{
++    static_assert(sizeof(void*) == 4 && DeviceMaxForce == 5000 && LeaseMs == 100);
++    const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
++    ExperimentalDriftEstimate d;
++    auto sample = [&](int raw, uint64_t t) { return d.step(raw, 0, 0, 1, true, t); };
++    auto prime = [&] {
++        d.reset();
++        for (uint64_t t = 0; t <= 240; t += 10) sample(0, t);
++        assert(d.status == DriftStatus::Grip);
++    };
++    for (int raw : {-32768, -2000, 2000, 32767})
++    {
++        prime();
++        for (uint64_t t = 250; t < 330; t += 10) assert(sample(raw, t) == DriftStatus::Grip);
++        assert(sample(raw, 330) == DriftStatus::Drift);
++        assert(sample(1001, 340) == DriftStatus::Drift);
++        assert(sample(1000, 350) == DriftStatus::Grip);
++    }
++    prime(); sample(3000, 250);
++    for (int i = 0; i < 100; ++i) assert(sample(3000, 250) == DriftStatus::Grip);
++    for (uint64_t t = 260; t <= 330; t += 10) sample(3000, t);
++    assert(sample(3000, 370) == DriftStatus::Drift); // Exactly 40ms.
++    for (uint64_t t : {369ull, 411ull, 469ull, 470ull})
++    { auto copy = d; assert(copy.step(3000, 0, 0, 1, true, t) == DriftStatus::Unknown); }
++    for (uint32_t flags : {0x10000u, 0x20000u, 0x30000u})
++    {
++        assert(d.step(3000, flags, 0, 1, true, d.tick) == DriftStatus::Unknown);
++        for (uint64_t t = 400; t <= 1000; t += 10) assert(sample(3000, t) == DriftStatus::Unknown);
++        for (uint64_t t = 1010; t <= 1240; t += 10) sample(0, t);
++        assert(d.status == DriftStatus::Grip);
++    }
++    prime(); assert(d.step(3000, 0, 0x40, 1, true, 250) == DriftStatus::Unknown);
++    for (float speed : {0.f, .099f, 11.f, nan, inf})
++    { prime(); assert(d.step(3000, 0, 0, speed, true, 250) == DriftStatus::Unknown && !d.started); }
++    for (int raw : {-32769, 32768}) { prime(); assert(sample(raw, 250) == DriftStatus::Unknown); }
++    prime(); assert(d.step(3000, 0, 0, 1, false, 250) == DriftStatus::Unknown);
++    prime(); assert(d.step(3000, 0, 0, 1, true, 250, 1000, 1000) == DriftStatus::Unknown);
++    prime(); assert(d.step(3000, 0, 0, 1, true, 250, 2000, -1) == DriftStatus::Unknown);
++    for (float floor : {0.f, 11.f, nan, inf})
++    { prime(); assert(d.step(3000, 0, 0, 1, true, 250, 2000, 1000, floor) == DriftStatus::Unknown); }
++    d.reset();
++    for (uint64_t t = 0; t < 5000; t += 10) assert(sample(8000, t) == DriftStatus::Unknown);
++
++    // A real percentage, independent of road endpoints, speed, surface and cadence.
++    for (float damping : {0.f, 20.f, 50.f, 100.f})
++    for (auto endpoints : {std::array{.02f, .08f}, std::array{.08f, .02f}, std::array{.1f, .3f}, std::array{0.f, .08f}})
++    for (float surface : {0.f, .45f, .9f, 1.f})
++    for (float speed : {.2f, 1.f, 2.f})
++    for (uint64_t cadence : {10ull, 17ull, 33ull, 40ull})
++    {
++        RoadRumble road; LegacyRoadRumble normal;
++        uint64_t now = 0;
++        auto step = [&](DriftStatus status) {
++            normal.step(speed, surface, endpoints[0], endpoints[1], 1, now);
++            const auto output = road.step(speed, surface, endpoints[0], endpoints[1], 1, now, status, damping);
++            assert(road.amplitude <= normal.amplitude + .001f);
++            assert(std::abs(LimitOutput(int64_t(output) + 1000)) <= 5000);
++            now += cadence;
++        };
++        for (int i = 0; i < 400; ++i) step(DriftStatus::Grip);
++        assert(std::abs(road.amplitude - normal.amplitude) < .001f);
++        for (int i = 0; i < 100; ++i) step(DriftStatus::Drift);
++        assert(std::abs(road.amplitude - normal.amplitude * (1 - damping / 100)) < .001f);
++        if (damping == 100) assert(road.amplitude == 0); // Only road, never master/centring.
++        const auto phase = road.phase;
++        const auto tick = road.tick;
++        road.step(speed, surface, endpoints[0], endpoints[1], 1, tick, DriftStatus::Drift, damping);
++        assert(road.phase == phase); // Duplicate timestamp cannot advance the waveform.
++        for (int i = 0; i < 100; ++i) step(DriftStatus::Grip);
++        assert(std::abs(road.amplitude - normal.amplitude) < .001f);
++        for (int i = 0; i < 100; ++i) step(DriftStatus::Drift);
++        road.driftAmount = 0; // The actual hook clears unknown/contact immediately.
++        for (int i = 0; i < 100; ++i) step(DriftStatus::Unknown);
++        assert(std::abs(road.amplitude - normal.amplitude) < .001f);
++        assert(road.step(speed, surface, endpoints[0], endpoints[1], 1, now + 100, DriftStatus::Drift, damping) == 0);
++        assert(road.amplitude == 0 && road.driftAmount == 0);
++    }
++    for (auto config : {std::array{0.f, 8.f}, std::array{-1.f, 8.f}, std::array{101.f, 8.f},
++        std::array{nan, 8.f}, std::array{inf, 8.f}, std::array{20.f, nan}, std::array{20.f, inf},
++        std::array{20.f, 5.9f}, std::array{20.f, 10.1f}})
++    {
++        RoadRumble road; LegacyRoadRumble normal;
++        uint64_t now = 0; uint32_t rng = 11;
++        for (int i = 0; i < 5000; ++i)
++        {
++            rng = rng * 1664525u + 1013904223u;
++            now += std::array<uint64_t, 7>{0, 16, 17, 33, 40, 41, 100}[rng % 7];
++            if (i % 67 == 0) { road.reset(); normal.reset(); }
++            const float surface = rng & 1 ? .9f : 0.f;
++            assert(road.step(1, surface, .02f, .08f, 1, now, DriftStatus::Drift, config[0], config[1]) == normal.step(1, surface, .02f, .08f, 1, now));
++            assert(road.phase == normal.phase && road.amplitude == normal.amplitude && road.driftAmount == 0);
++        }
++    }
++    RoadRumble road;
++    for (uint64_t now = 0; now <= 300; now += 10)
++    {
++        const auto previous = road.phase;
++        const bool started = road.started;
++        road.step(1, .9f, .02f, .08f, 1, now, DriftStatus::Drift, 20);
++        if (started) assert(std::abs(road.phase - std::fmod(previous + std::lerp(10.0, 8.0, double(road.driftAmount)) * (10.f / 1000.f), 1.0)) < 1e-12);
++        assert(std::abs(road.driftAmount - (std::min)(1.f, float(now) / 100)) < .00001f);
++    }
++    assert(road.step(1, .9f, 0, 0, 1, 310, DriftStatus::Drift, 20) == 0 && !road.started);
++    std::cout << "PASS: drift detector gates, 0/20/50/100 percent damping, endpoint independence, neutral legacy equivalence, phase/clock/contact/recovery checks; synthetic only\n";
++}
+diff --git a/tests/legacy_road.hpp b/tests/legacy_road.hpp
+new file mode 100644
+index 0000000..9f8abfb
+--- /dev/null
++++ b/tests/legacy_road.hpp
+@@ -0,0 +1,51 @@
++// Frozen pre-drift road model for independent equivalence checks.
++namespace NativeFfb {
++struct LegacyRoadRumble
++{
++    uint64_t tick = 0;
++    double phase = 0;
++    float amplitude = 0;
++    bool started = false;
++
++    void reset() { *this = {}; }
++
++    LONG step(float speed, float roughness, float roadStrength, float offroadStrength,
++        float fullSpeed, uint64_t now)
++    {
++        if (!std::isfinite(speed) || speed <= 0.001f || speed > 10 ||
++            !std::isfinite(roughness) || roughness < 0 || roughness > 1 ||
++            !std::isfinite(roadStrength) || roadStrength < 0 ||
++            !std::isfinite(offroadStrength) || offroadStrength < 0 ||
++            (roadStrength == 0 && offroadStrength == 0) ||
++            !std::isfinite(fullSpeed) || fullSpeed < 0.05f || fullSpeed > 10)
++        {
++            reset();
++            return 0;
++        }
++        // Suppress undersampled continuous vibration rather than aliasing it
++        // into a one-sided pull. First sample after any gap starts at zero.
++        if (!started || !Fresh(now, tick) || now - tick > 40)
++        {
++            reset();
++            started = true;
++            tick = now;
++            return 0;
++        }
++        const float dt = float(now - tick) / 1000.0f;
++        tick = now;
++        const float speedGain = std::clamp(speed / fullSpeed, 0.0f, 1.0f);
++        const float surfaceGain = std::clamp(roughness / 0.9f, 0.0f, 1.0f);
++        const float strength = std::lerp(std::clamp(roadStrength, 0.0f, MaxStrength),
++            std::clamp(offroadStrength, 0.0f, MaxStrength), surfaceGain);
++        const float target = strength * speedGain * DI_FFNOMINALMAX;
++        const float slew = 5000.0f * (std::min)(dt, 0.02f);
++        amplitude += std::clamp(target - amplitude, -slew, slew);
++        // Lowering a configured strength never leaves a stronger residual.
++        amplitude = (std::min)(amplitude, strength * DI_FFNOMINALMAX);
++        // ponytail: 6-10 Hz software rumble, >=25 Hz updates required; use hardware periodics for higher frequencies/low FPS.
++        phase = std::fmod(phase + (6.0 + 4.0 * speedGain) * dt, 1.0);
++        return LONG(std::sin(2 * std::numbers::pi * phase) * amplitude);
++    }
++};
++
++}
+diff --git a/tests/native_ffb_test.cpp b/tests/native_ffb_test.cpp
+new file mode 100644
+index 0000000..5bd6bdd
+--- /dev/null
++++ b/tests/native_ffb_test.cpp
+@@ -0,0 +1,684 @@
++// Hardware-free check: only fake COM objects, no DirectInput8Create/game launch.
++#include "../src/native_ffb.hpp"
++#include <cassert>
++#include <climits>
++#include <utility>
++#include <iostream>
++#include <limits>
++#include <string>
++#include <vector>
++#include <fstream>
++#include <map>
++#include <sstream>
++#include <memory>
++
++#define UNUSED_METHOD(name, args) HRESULT STDMETHODCALLTYPE name args override { assert(!"Unexpected COM call: " #name); return E_NOTIMPL; }
++#define UNKNOWN_METHODS \
++    UNUSED_METHOD(QueryInterface, (REFIID, LPVOID*)) \
++    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
++
++struct Trace
++{
++    std::vector<std::string> calls;
++    std::string fail;
++    HRESULT failure = E_FAIL;
++    HRESULT hit(const char* name) { calls.emplace_back(name); return fail == name ? failure : S_OK; }
++    int count(const char* name) const { return int(std::count(calls.begin(), calls.end(), name)); }
++};
++
++struct Effect : IDirectInputEffect
++{
++    Trace& t;
++    DWORD reportedDuration = NativeFfb::LeaseMs * 1000;
++    uint64_t now = 0, expires = 0;
++    LONG magnitude = 0;
++    explicit Effect(Trace& trace) : t(trace) {}
++    UNKNOWN_METHODS
++    ULONG STDMETHODCALLTYPE Release() override { t.hit("effect.release"); return 0; }
++    UNUSED_METHOD(Initialize, (HINSTANCE, DWORD, REFGUID))
++    UNUSED_METHOD(GetEffectGuid, (LPGUID))
++    HRESULT STDMETHODCALLTYPE GetParameters(LPDIEFFECT desc, DWORD flags) override
++    {
++        assert(flags == DIEP_DURATION);
++        desc->dwDuration = reportedDuration;
++        return t.hit("duration");
++    }
++    HRESULT STDMETHODCALLTYPE SetParameters(LPCDIEFFECT desc, DWORD flags) override
++    {
++        assert(flags == (DIEP_TYPESPECIFICPARAMS | DIEP_START));
++        assert(desc->cbTypeSpecificParams == sizeof(DICONSTANTFORCE));
++        const HRESULT hr = t.hit("submit");
++        if (SUCCEEDED(hr))
++        {
++            magnitude = static_cast<DICONSTANTFORCE*>(desc->lpvTypeSpecificParams)->lMagnitude;
++            assert(std::abs(magnitude) <= NativeFfb::DeviceMaxForce);
++            expires = now + NativeFfb::LeaseMs;
++        }
++        return hr;
++    }
++    UNUSED_METHOD(Start, (DWORD, DWORD))
++    HRESULT STDMETHODCALLTYPE Stop() override
++    {
++        const auto hr = t.hit("stop");
++        if (SUCCEEDED(hr)) magnitude = 0;
++        return hr;
++    }
++    UNUSED_METHOD(GetEffectStatus, (LPDWORD))
++    UNUSED_METHOD(Download, ())
++    UNUSED_METHOD(Unload, ())
++    UNUSED_METHOD(Escape, (LPDIEFFESCAPE))
++    LONG output() const { return now < expires ? magnitude : 0; }
++};
++
++struct Wheel : IDirectInputDevice8A
++{
++    Trace& t;
++    Effect fx;
++    DWORD autocentre = DIPROPAUTOCENTER_ON;
++    bool acquired = false, hasFfb = true, hasAxis = true, hasDuration = true;
++    explicit Wheel(Trace& trace) : t(trace), fx(trace) {}
++    UNKNOWN_METHODS
++    ULONG STDMETHODCALLTYPE Release() override { t.hit("device.release"); return 0; }
++    HRESULT STDMETHODCALLTYPE GetCapabilities(LPDIDEVCAPS caps) override
++    { caps->dwFlags = hasFfb ? DIDC_FORCEFEEDBACK : 0; return t.hit("caps"); }
++    UNUSED_METHOD(EnumObjects, (LPDIENUMDEVICEOBJECTSCALLBACKA, LPVOID, DWORD))
++    HRESULT STDMETHODCALLTYPE GetProperty(REFGUID guid, LPDIPROPHEADER prop) override
++    {
++        assert(&guid == &DIPROP_AUTOCENTER && !acquired);
++        reinterpret_cast<DIPROPDWORD*>(prop)->dwData = autocentre;
++        return t.hit("get.autocentre");
++    }
++    HRESULT STDMETHODCALLTYPE SetProperty(REFGUID guid, LPCDIPROPHEADER prop) override
++    {
++        assert(&guid == &DIPROP_AUTOCENTER && !acquired);
++        const DWORD value = reinterpret_cast<const DIPROPDWORD*>(prop)->dwData;
++        const auto hr = t.hit(value == DIPROPAUTOCENTER_OFF ? "autocentre.off" : "autocentre.restore");
++        if (SUCCEEDED(hr)) autocentre = value;
++        return hr;
++    }
++    HRESULT STDMETHODCALLTYPE Acquire() override
++    { auto hr = t.hit("acquire"); if (SUCCEEDED(hr)) acquired = true; return hr; }
++    HRESULT STDMETHODCALLTYPE Unacquire() override
++    { acquired = false; return t.hit("unacquire"); }
++    UNUSED_METHOD(GetDeviceState, (DWORD, LPVOID))
++    UNUSED_METHOD(GetDeviceData, (DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD))
++    HRESULT STDMETHODCALLTYPE SetDataFormat(LPCDIDATAFORMAT format) override
++    { assert(format == &c_dfDIJoystick2); return t.hit("format"); }
++    UNUSED_METHOD(SetEventNotification, (HANDLE))
++    HRESULT STDMETHODCALLTYPE SetCooperativeLevel(HWND hwnd, DWORD flags) override
++    { assert(hwnd && flags == (DISCL_EXCLUSIVE | DISCL_FOREGROUND)); return t.hit("cooperative"); }
++    HRESULT STDMETHODCALLTYPE GetObjectInfo(LPDIDEVICEOBJECTINSTANCEA axis, DWORD offset, DWORD how) override
++    {
++        assert(offset == DIJOFS_X && how == DIPH_BYOFFSET);
++        axis->guidType = GUID_XAxis;
++        axis->dwFlags = hasAxis ? DIDOI_FFACTUATOR : 0;
++        return t.hit("axis");
++    }
++    UNUSED_METHOD(GetDeviceInfo, (LPDIDEVICEINSTANCEA))
++    UNUSED_METHOD(RunControlPanel, (HWND, DWORD))
++    UNUSED_METHOD(Initialize, (HINSTANCE, DWORD, REFGUID))
++    HRESULT STDMETHODCALLTYPE CreateEffect(REFGUID guid, LPCDIEFFECT desc, LPDIRECTINPUTEFFECT* out, LPUNKNOWN) override
++    {
++        assert(acquired && guid == GUID_ConstantForce);
++        assert(desc->dwFlags == (DIEFF_CARTESIAN | DIEFF_OBJECTOFFSETS));
++        assert(desc->dwDuration == NativeFfb::LeaseMs * 1000 && desc->dwGain == DI_FFNOMINALMAX);
++        assert(desc->dwTriggerButton == DIEB_NOTRIGGER && !desc->lpEnvelope);
++        assert(desc->cAxes == 1 && *desc->rgdwAxes == DIJOFS_X && *desc->rglDirection == DI_FFNOMINALMAX);
++        assert(static_cast<DICONSTANTFORCE*>(desc->lpvTypeSpecificParams)->lMagnitude == 0);
++        auto hr = t.hit("create.effect");
++        if (SUCCEEDED(hr)) *out = &fx;
++        return hr;
++    }
++    UNUSED_METHOD(EnumEffects, (LPDIENUMEFFECTSCALLBACKA, LPVOID, DWORD))
++    HRESULT STDMETHODCALLTYPE GetEffectInfo(LPDIEFFECTINFOA info, REFGUID guid) override
++    { assert(guid == GUID_ConstantForce); info->dwStaticParams = hasDuration ? DIEP_DURATION : 0; return t.hit("effect.info"); }
++    UNUSED_METHOD(GetForceFeedbackState, (LPDWORD))
++    HRESULT STDMETHODCALLTYPE SendForceFeedbackCommand(DWORD command) override
++    { assert(command == DISFFC_STOPALL); return t.hit("stopall"); }
++    UNUSED_METHOD(EnumCreatedEffectObjects, (LPDIENUMCREATEDEFFECTOBJECTSCALLBACK, LPVOID, DWORD))
++    UNUSED_METHOD(Escape, (LPDIEFFESCAPE))
++    UNUSED_METHOD(Poll, ())
++    UNUSED_METHOD(SendDeviceData, (DWORD, LPCDIDEVICEOBJECTDATA, LPDWORD, DWORD))
++    UNUSED_METHOD(EnumEffectsInFile, (LPCSTR, LPDIENUMEFFECTSINFILECALLBACK, LPVOID, DWORD))
++    UNUSED_METHOD(WriteEffectToFile, (LPCSTR, DWORD, LPDIFILEEFFECT, DWORD))
++    UNUSED_METHOD(BuildActionMap, (LPDIACTIONFORMATA, LPCSTR, DWORD))
++    UNUSED_METHOD(SetActionMap, (LPDIACTIONFORMATA, LPCSTR, DWORD))
++    UNUSED_METHOD(GetImageInfo, (LPDIDEVICEIMAGEINFOHEADERA))
++};
++
++struct Factory : IDirectInput8A
++{
++    Trace t;
++    Wheel wheel{ t };
++    unsigned matches = 1;
++    GUID selected{ 123 };
++    UNKNOWN_METHODS
++    ULONG STDMETHODCALLTYPE Release() override { assert(false); return 0; } // Borrowed factory.
++    HRESULT STDMETHODCALLTYPE CreateDevice(REFGUID guid, LPDIRECTINPUTDEVICE8A* out, LPUNKNOWN) override
++    {
++        assert(guid == selected);
++        auto hr = t.hit("create.device");
++        if (SUCCEEDED(hr)) *out = &wheel;
++        return hr;
++    }
++    HRESULT STDMETHODCALLTYPE EnumDevices(DWORD kind, LPDIENUMDEVICESCALLBACKA callback, LPVOID context, DWORD flags) override
++    {
++        assert(kind == DI8DEVCLASS_GAMECTRL && flags == DIEDFL_ATTACHEDONLY);
++        auto hr = t.hit("enum");
++        if (FAILED(hr)) return hr;
++        DIDEVICEINSTANCEA info{ sizeof(info) };
++        info.guidProduct.Data1 = 0x12345678; // Never fall back to the first controller.
++        callback(&info, context);
++        info.guidProduct.Data1 = MAKELONG(0x346E, 5);
++        info.guidInstance = selected;
++        for (unsigned i = 0; i < matches; ++i) callback(&info, context);
++        return S_OK;
++    }
++    UNUSED_METHOD(GetDeviceStatus, (REFGUID))
++    UNUSED_METHOD(RunControlPanel, (HWND, DWORD))
++    UNUSED_METHOD(Initialize, (HINSTANCE, DWORD))
++    UNUSED_METHOD(FindDevice, (REFGUID, LPCSTR, LPGUID))
++    UNUSED_METHOD(EnumDevicesBySemantics, (LPCSTR, LPDIACTIONFORMATA, LPDIENUMDEVICESBYSEMANTICSCBA, LPVOID, DWORD))
++    UNUSED_METHOD(ConfigureDevices, (LPDICONFIGUREDEVICESCALLBACK, LPDICONFIGUREDEVICESPARAMSA, DWORD, LPVOID))
++};
++
++static void replayCollisions(const char* path)
++{
++    std::ifstream file(path);
++    assert(file.is_open());
++    NativeFfb::CollisionJolt collision;
++    std::string line, car;
++    std::vector<unsigned> onsets;
++    unsigned samples = 0, braking = 0, positive = 0, negative = 0;
++    while (std::getline(file, line))
++    {
++        const std::string prefix = "Native FFB collision sample: ";
++        const auto start = line.find(prefix);
++        if (start == std::string::npos) continue;
++        ++samples;
++        std::map<std::string, std::string> row;
++        std::istringstream fields(line.substr(start + prefix.size()));
++        for (std::string field; fields >> field;)
++        {
++            const auto split = field.find('=');
++            assert(split != std::string::npos);
++            row.emplace(field.substr(0, split), field.substr(split + 1));
++        }
++        if (row.at("car") != car) collision.reset();
++        car = row.at("car");
++        if (row.at("racing") != "true" || row.at("focus") != "true" || row.at("pad") != "true" ||
++            row.at("blocked") != "false" || row.at("finite") != "true")
++        {
++            collision.reset();
++            continue;
++        }
++        const LONG force = collision.step(uint32_t(std::stoul(row.at("flags4"), nullptr, 0)),
++            uint32_t(std::stoul(row.at("flags8"), nullptr, 0)), std::stof(row.at("raw1C4")), .50f,
++            std::stoull(row.at("tick")));
++        if (collision.triggered) onsets.push_back(unsigned(std::stoul(row.at("seq"))));
++        assert(std::abs(force) <= 5000);
++        positive += force > 0;
++        negative += force < 0;
++        if (std::stoi(row.at("brake")) > 3276) { ++braking; assert(force == 0); }
++    }
++    assert(samples == 2502 && braking == 178 && positive && negative);
++    // Includes an earlier brake-labelled but brake-released contact-like event.
++    assert((onsets == std::vector<unsigned>{483, 1434, 1983}));
++    std::cout << "PASS: captured-data replay, 2502 samples, 3 narrow onsets, 178 brake-pressed samples silent; not a runtime/hang validation\n";
++}
++
++static void testProbe(const char* fixturePath)
++{
++    using namespace NativeFfb;
++    using namespace NativeFfb::Probe;
++    // Heap allocation is test-only; the game owns one static fixed-capacity buffer.
++    auto c = std::make_unique<Capture>();
++    Sample s;
++    assert(!c->push(s) && !c->canFlush(true, true));
++    assert(!c->start(1000, 999) && !c->start(1000, MaxDurationMs + 1));
++    assert(c->start(1000, 1000) && !c->start(1000, 1000));
++    assert(!c->canFlush(true, true));
++    for (uint64_t t : {1000ull, 1000ull, 1040ull, 1081ull, 1180ull, 1280ull})
++    {
++        s.tick = t;
++        assert(c->push(s)); // Preserve duplicates and 40/41/99/100ms gaps, not inferred ticks.
++    }
++    c->poll(1999); assert(c->running());
++    c->poll(2000); assert(c->reason == Stop::Deadline);
++    assert(!c->canFlush(false, true) && !c->canFlush(true, false));
++    assert(c->canFlush(true, true) && !c->push(s) && c->count == 6);
++    assert(!c->start(3000, 1000));
++    for (auto reason : {Stop::Operator, Stop::Shutdown})
++    {
++        c = std::make_unique<Capture>();
++        assert(c->start(0, 1000)); c->stop(reason);
++        assert(c->reason == reason && c->canFlush(true, true));
++    }
++    c = std::make_unique<Capture>();
++    assert(c->start(1000, 1000)); c->poll(999); assert(c->reason == Stop::Clock);
++    c = std::make_unique<Capture>();
++    assert(c->start(0, MaxDurationMs));
++    for (size_t i = 0; i < Capacity; ++i) { s.tick = i; assert(c->push(s)); }
++    assert(c->reason == Stop::Full && c->count == Capacity && !c->push(s));
++    assert(c->samples.front().tick == 0 && c->samples.back().tick == Capacity - 1);
++
++    DWORD water = 123;
++    auto lookup = [](unsigned mask, int, DWORD* wet) -> double { if (mask == 2) *wet |= 1; return mask == 1 ? 0 : .75; };
++    assert(SurfaceRoughness({1,2,0,0}, 0, lookup, &water) == .75f && water == 1);
++    assert(SurfaceRoughness({2,3,0,0}, 0, lookup, &water) == -1 && water == 0);
++    water = 123;
++    assert(SurfaceRoughness({0,0,0,0}, 0, lookup, &water) == -1 && water == 0);
++    assert(SurfaceRoughness({1,0,0,0}, 0, lookup, &water) == 0 && water == 0);
++
++    c = std::make_unique<Capture>();
++    assert(c->start(1000, 1000)); s = {};
++    s.player = 1; s.carId = 2; s.mode = 0x10; s.pauseMenu = 0;
++    s.focus = s.connected = s.inputFresh = s.finite = s.surfaceValid = true;
++    s.raw = {.5f, .5f, 0, 0, 0, 0, 0}; s.gear = 2;
++    s.surfaces = {1,1,1,1}; s.roughness = 0;
++    CollisionJolt collision;
++    unsigned onsets = 0;
++    for (unsigned i = 0; i < 40; ++i)
++    {
++        s.tick = s.inputTick = 1000 + i * 16; s.timeUs = i * 16000;
++        // Synthetic separate contacts. Markers are not detector ground truth.
++        s.flags4 = i == 1 || i == 35 ? 0x20000 : 0;
++        s.flags8 = s.flags4 ? 0x100 : 0; s.marker = 2;
++        assert(c->push(s));
++        collision.step(s.flags4, s.flags8, s.raw[1], .5f, s.tick);
++        onsets += collision.triggered;
++    }
++    assert(onsets == 2); c->stop(Stop::Operator);
++    std::ostringstream out; WriteCapture(out, *c);
++    assert(out.str().starts_with("# native-ffb-p0-v1 count=40 ") && out.str().ends_with("# end count=40\n"));
++    if (fixturePath)
++    {
++        std::ofstream file(fixturePath, std::ios::binary | std::ios::trunc);
++        assert(file.is_open()); WriteCapture(file, *c); file.close(); assert(file.good());
++    }
++    std::cout << "PASS: P0 buffer/deadline/full/clock/flush gates, surface+water validity and synthetic model replay (no hardware)\n";
++}
++
++static void replayProbe(const char* path)
++{
++    // Use the strict Python integrity checker first. Feed actual CollisionJolt,
++    // not copied force math. This does not validate new candidate signals.
++    std::ifstream file(path); assert(file.is_open());
++    std::string line;
++    assert(std::getline(file, line) && line.starts_with("# native-ffb-p0-v1 "));
++    assert(std::getline(file, line));
++    std::vector<std::string> names;
++    std::istringstream header(line);
++    for (std::string name; std::getline(header, name, ',');) names.push_back(name);
++    NativeFfb::CollisionJolt collision;
++    std::string identity;
++    uint64_t previousTick = 0;
++    unsigned count = 0;
++    bool footer = false;
++    while (std::getline(file, line))
++    {
++        if (line.starts_with("# end count=")) { assert(std::stoul(line.substr(12)) == count); footer = true; break; }
++        std::map<std::string, std::string> row;
++        std::istringstream fields(line);
++        size_t index = 0;
++        for (std::string value; std::getline(fields, value, ',');) { assert(index < names.size()); row.emplace(names[index++], value); }
++        assert(index == names.size() && std::stoul(row.at("seq")) == ++count);
++        const auto tick = std::stoull(row.at("tick"));
++        const auto key = row.at("player") + "/" + row.at("car_id") + "/" + row.at("stage") + "/" + row.at("load_type");
++        if (key != identity) collision.reset();
++        identity = key;
++        const bool valid = row.at("mode") == "16" && row.at("focus") == "1" && row.at("pad") == "1" &&
++            row.at("overlay") == "0" && row.at("binding") == "0" && row.at("input_fresh") == "1" && row.at("finite") == "1";
++        if (!valid || (count > 1 && tick <= previousTick)) collision.reset();
++        else
++        {
++            collision.step(uint32_t(std::stoul(row.at("flags4"))), uint32_t(std::stoul(row.at("flags8"))),
++                std::stof(row.at("raw1C4")), .5f, tick);
++            if (collision.triggered) std::cout << "P0 replay onset seq=" << count << '\n';
++        }
++        previousTick = tick;
++    }
++    assert(footer && !std::getline(file, line));
++    std::cout << "PASS: P0 CSV replay through actual CollisionJolt, " << count << " samples; no signal-validation claim\n";
++}
++
++int main(int argc, char** argv)
++{
++    assert(argc == 1 || argc == 2 || argc == 3);
++    if (argc == 2) replayCollisions(argv[1]);
++    const bool writeFixture = argc == 3 && std::string(argv[1]) == "--write-probe-fixture";
++    if (argc == 3 && !writeFixture) { assert(std::string(argv[1]) == "--probe-csv"); replayProbe(argv[2]); }
++    testProbe(writeFixture ? argv[2] : nullptr);
++    using namespace NativeFfb;
++    const auto hwnd = reinterpret_cast<HWND>(1); // Never passed to Windows, only the fake.
++    static_assert(MaxForce == 10000 && MaxStrength == 1.0f && ShiftJolt::MaxStrength == 1.0f);
++    static_assert(CentreForce::MaxStrength == 1.0f && CollisionJolt::MaxStrength == 1.0f);
++    // Actual output, not a normalized old cap: zero, old presets, 100%, and over-range clamp.
++    for (float strength : { 0.0f, .01f, .10f, .50f, 1.0f, 2.0f })
++    {
++        const LONG expected = LONG(std::clamp(strength, 0.0f, 1.0f) * 10000);
++        CentreForce centre;
++        RoadRumble road, offroad;
++        for (uint64_t time = 0; time <= 10000; time += 10)
++        {
++            assert(std::abs(centre.step(1, strength, 0, .02f, false, time)) <= expected);
++            assert(std::abs(road.step(1, 0, strength, 0, 1, time)) <= expected);
++            assert(std::abs(offroad.step(1, .9f, 0, strength, 1, time)) <= expected);
++        }
++        assert(centre.level == -expected && road.amplitude == expected && offroad.amplitude == expected);
++        ShiftJolt shift;
++        shift.step(2, strength, 0);
++        shift.step(3, strength, 10);
++        // Decimal float strengths can truncate one DI unit in the double-precision sine.
++        assert(std::abs(shift.step(3, strength, 50) - expected) <= 1);
++        assert(std::abs(shift.step(3, strength, 130) + expected) <= 1);
++        CollisionJolt contact;
++        contact.step(0, 0, .5f, strength, 0);
++        contact.step(0x20000, 0x100, .5f, strength, 10);
++        assert(std::abs(contact.step(0x20000, 0x100, .5f, strength, 40) - expected) <= 1);
++        contact.step(0x20000, 0x100, .5f, strength, 70);
++        assert(std::abs(contact.step(0x20000, 0x100, .5f, strength, 100) + expected) <= 1);
++    }
++    CentreForce left, right;
++    for (uint64_t time = 0; time <= 1000; time += 10)
++    {
++        LONG l = left.step(-1, .10f, 0, .02f, false, time);
++        LONG r = right.step(1, .10f, 0, .02f, false, time);
++        assert(l == -r && l >= 0 && l <= MaxForce);
++        assert(l <= LONG(time)); // Slew limit in DI units per millisecond.
++    }
++    assert(left.level == 1000 && right.level == -1000);
++    assert(left.step(0, .05f, 0, .02f, false, 1010) == 0);
++    assert(right.step(-1, .05f, 0, .02f, false, 1010) >= 0); // No wrong-side residual.
++    assert(right.step(1, .05f, 0, .02f, false, 1110) == 0); // Stale -> fresh ramp.
++    assert(right.step(1, .05f, 0, .02f, false, 1000) == 0); // Backward clock.
++    for (float invalid : { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -2.0f, 2.0f })
++        assert(left.step(invalid, .05f, 0, .02f, false, 1020) == 0);
++    for (float invalid : { std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -1.0f, 0.0f })
++        assert(left.step(1, invalid, 0, .02f, false, 1020) == 0);
++    assert(left.step(1, .05f, .5f, .02f, false, 1020) == 0);
++    assert(left.step(1, .05f, 0, -.1f, false, 1020) == 0);
++    assert(left.step(1, .05f, 0, std::numeric_limits<float>::quiet_NaN(), false, 1020) == 0);
++    left.reset(); right.reset();
++    for (uint64_t time = 0; time <= 1000; time += 10)
++    {
++        assert(left.step(1, 100, 0, .02f, false, time) == -right.step(1, .10f, 0, .02f, true, time));
++    }
++    assert(left.level == -1000 && right.level == 1000); // Not silently clipped to the old 5% cap.
++    assert(std::abs(left.step(1, .001f, 0, .02f, false, 1010)) <= 10); // Lower cap immediately.
++    assert(left.step(.12f, .05f, .12f, .02f, false, 1020) == 0); // Calibrated centre.
++
++    // Real gear edges, not paddles: one smooth two-sided pulse, never on baseline/resume.
++    for (auto gears : { std::pair{ 1u, 2u }, std::pair{ 6u, 5u } })
++    {
++        ShiftJolt jolt;
++        assert(jolt.step(gears.first, .03f, 0) == 0);
++        assert(jolt.step(gears.second, .03f, 10) == 0);
++        long integral = 0;
++        for (uint64_t age = 1; age <= ShiftJolt::DurationMs; ++age)
++        {
++            LONG force = jolt.step(gears.second, .03f, 10 + age);
++            assert(std::abs(force) <= 300);
++            if (age == 40) assert(force >= 299);
++            if (age == 120) assert(force <= -299);
++            integral += force;
++        }
++        assert(std::abs(integral) <= 2 && !jolt.pulsing);
++        assert(jolt.step(gears.second, .03f, 180) == 0); // Held gear never repeats.
++    }
++    ShiftJolt jolt;
++    assert(jolt.step(2, .03f, 0) == 0);
++    assert(jolt.step(3, .03f, 10) == 0);
++    jolt.step(4, .03f, 30); // Another shift must not extend or stack this pulse.
++    assert(jolt.step(4, .03f, 50) >= 299);
++    assert(jolt.step(4, .03f, 130) <= -299);
++    assert(jolt.step(4, .03f, 170) == 0 && !jolt.pulsing);
++    assert(jolt.step(5, .03f, 180) == 0 && !jolt.pulsing); // Cooldown, no queued jolt.
++    for (uint64_t time = 200; time <= 320; time += 20) assert(jolt.step(5, .03f, time) == 0);
++    assert(jolt.step(6, .03f, 330) == 0);
++    assert(jolt.step(6, .03f, 370) >= 299);
++    jolt.reset(); // Same path as pause/focus loss/disconnect/exit/car replacement.
++    assert(jolt.step(3, .03f, 380) == 0 && !jolt.pulsing);
++    assert(jolt.step(3, .03f, 390) == 0);
++    assert(jolt.step(5, .03f, 400) == 0 && !jolt.pulsing); // Non-adjacent jump is not a shift effect.
++    assert(jolt.step(6, .03f, 410) == 0);
++    assert(jolt.step(6, .03f, 510) == 0 && !jolt.pulsing); // Stale callback cannot resume old pulse.
++    assert(jolt.step(5, .03f, 520) == 0);
++    assert(jolt.step(5, .03f, 500) == 0 && !jolt.pulsing); // Backward clock.
++    for (uint32_t invalid : { 0u, 7u, 0xFFFFFFFFu })
++    {
++        assert(jolt.step(invalid, .03f, 530) == 0);
++        assert(jolt.step(2, .03f, 540) == 0 && !jolt.pulsing);
++    }
++    for (float invalid : { 0.0f, -1.0f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN() })
++    {
++        jolt.reset();
++        jolt.step(2, .03f, 0);
++        jolt.step(3, .03f, 10);
++        assert(jolt.step(3, invalid, 50) == 0 && !jolt.pulsing);
++        assert(jolt.step(3, .03f, 60) == 0 && !jolt.pulsing);
++    }
++    jolt.reset();
++    jolt.step(2, 100, 0);
++    jolt.step(3, 100, 10);
++    assert(jolt.step(3, 100, 50) == 10000); // Clamp even when bypassing the settings registry.
++    assert(jolt.step(3, .50f, 130) == -5000); // Existing numeric values retain their meaning.
++    assert(Mix(4900, 300) == 5200 && Mix(-4900, -300) == -5200);
++    assert(Mix(900, -300) == 600 && Mix(-900, 300) == -600);
++    assert(Mix(1000, 5000, 500) == 6500 && Mix(-1000, -5000, -500) == -6500);
++    assert(Mix(LONG_MAX, LONG_MAX, LONG_MAX) == MaxForce && Mix(LONG_MIN, LONG_MIN, LONG_MIN) == -MaxForce);
++    assert(Mix(0, 0) == 0 && Mix(500, 0) == 500); // Disabled accents preserve centring.
++    assert(Mix(LONG_MAX, LONG_MAX) == MaxForce && Mix(LONG_MIN, LONG_MIN) == -MaxForce);
++
++    static_assert(CollisionJolt::MaxStrength == 1.0f);
++    CollisionJolt collision;
++    assert(collision.step(0, 0, .5f, .50f, 0) == 0);
++    assert(collision.step(0x20000, 0x100, .5f, .50f, 10) == 0 && collision.triggered);
++    long collisionIntegral = 0;
++    for (uint64_t age = 1; age <= CollisionJolt::DurationMs; ++age)
++    {
++        const LONG force = collision.step(0x20000, 0x100, .5f, .50f, 10 + age);
++        assert(std::abs(force) <= 5000 && !collision.triggered);
++        if (age == 30) assert(force == 5000);
++        if (age == 90) assert(force == -5000);
++        collisionIntegral += force;
++    }
++    assert(std::abs(collisionIntegral) <= 2 && !collision.pulsing);
++    for (uint64_t time = 140; time <= 600; time += 20)
++        assert(collision.step(0x20000, 0x100, .5f, .50f, time) == 0); // Held signature never repeats.
++    auto primeCollision = [&] {
++        collision.reset();
++        assert(collision.step(0, 0, .5f, .50f, 0) == 0);
++        assert(collision.step(0x20000, 0x100, .5f, .50f, 10) == 0 && collision.triggered);
++    };
++    primeCollision();
++    collision.step(0, 0, .5f, .50f, 20);
++    collision.step(0x20000, 0x100, .5f, .50f, 30);
++    assert(collision.pulseTick == 10 && !collision.triggered); // No stacking/extension.
++    for (uint64_t time = 40; time <= 140; time += 20) collision.step(0, 0, .5f, .50f, time);
++    assert(collision.step(0x20000, 0x100, .5f, .50f, 150) == 0 && !collision.triggered); // Cooldown, not queued.
++    for (uint64_t time = 160; time <= 500; time += 20) assert(collision.step(0, 0, .5f, .50f, time) == 0);
++    assert(collision.step(0x20000, 0x100, .5f, .50f, 510) == 0 && collision.triggered);
++    primeCollision();
++    assert(collision.step(0x20000, 0x100, .5f, 100, 40) == 10000); // Clamp even bypassing settings.
++    assert(std::abs(collision.step(0x20000, 0x100, .5f, .001f, 41)) <= 10);
++    assert(collision.step(0x20000, 0x100, .5f, .50f, 82) == 0 && !collision.pulsing); // >40ms gap.
++    assert(collision.step(0x20000, 0x100, .5f, .50f, 80) == 0 && !collision.triggered); // Backward clock.
++    assert(collision.step(0x20000, 0x100, .5f, .50f, 180) == 0 && !collision.triggered); // Lease-sized gap.
++    for (auto values : { std::pair{0.f,.5f}, std::pair{-1.f,.5f}, std::pair{11.f,.5f},
++            std::pair{std::numeric_limits<float>::quiet_NaN(),.5f},
++            std::pair{std::numeric_limits<float>::infinity(),.5f}, std::pair{.5f,0.f}, std::pair{.5f,-1.f},
++            std::pair{.5f,std::numeric_limits<float>::quiet_NaN()}, std::pair{.5f,std::numeric_limits<float>::infinity()} })
++    {
++        primeCollision();
++        assert(collision.step(0x20000, 0x100, values.first, values.second, 40) == 0 && !collision.started);
++        assert(collision.step(0x20000, 0x100, .5f, .50f, 50) == 0 && !collision.triggered);
++    }
++    collision.reset(); // Lifecycle/car replacement shares this reset.
++    assert(collision.step(0x20000, 0x100, .5f, .50f, 0) == 0 && !collision.triggered);
++    for (uint64_t time = 10; time <= 100; time += 10)
++    {
++        assert(collision.step(0x20000, 0x800, .5f, .50f, time) == 0); // Scrape-only signature excluded.
++        assert(collision.step(0x10000, 0x1000, .5f, .50f, time) == 0); // No guessed traffic fallback.
++        assert(collision.step(0, 0x100, .5f, .50f, time) == 0); // Both bits required.
++    }
++    assert(Mix(1000, 5000, 500, 5000) == 10000 && Mix(-1000, -5000, -500, -5000) == -10000);
++    assert(Mix(100, 200, 300, -400) == 200 && Mix(100, 200, 300, 0) == Mix(100, 200, 300));
++    assert(Mix(LONG_MAX, LONG_MAX, LONG_MAX, LONG_MAX) == MaxForce);
++    assert(Mix(LONG_MIN, LONG_MIN, LONG_MIN, LONG_MIN) == -MaxForce);
++
++    static int lookupCalls = 0;
++    auto lookup = [](unsigned mask, int loadType, DWORD* water) -> double {
++        ++lookupCalls;
++        assert(loadType == 42 && water);
++        if (mask == 2) *water |= 1;
++        return mask == 1 ? 0.0 : mask == 2 ? 0.25 : mask == 4 ? 0.7 : 0.9;
++    };
++    assert(std::abs(SurfaceRoughness({ 1, 2, 4, 8 }, 42, lookup) - .9f) < .00001f && lookupCalls == 4);
++    lookupCalls = 0;
++    assert(SurfaceRoughness({ 0, 1, 0, 2 }, 42, lookup) == .25f && lookupCalls == 2);
++    assert(SurfaceRoughness({ 0, 0, 0, 0 }, 42, lookup) == -1);
++    assert(SurfaceRoughness({ 3, 0, 0, 0 }, 42, lookup) == -1);
++    assert(SurfaceRoughness({ 0x1000000, 0, 0, 0 }, 42, lookup) == -1);
++    assert(SurfaceRoughness({ 1, 0, 0, 0 }, 42, nullptr) == -1);
++    assert(SurfaceRoughness({ 1, 0, 0, 0 }, 0, [](unsigned, int, DWORD*) -> double {
++        return std::numeric_limits<double>::quiet_NaN(); }) == -1);
++
++    RoadRumble cadence;
++    assert(cadence.step(1, .9f, .01f, .05f, 1, 0) == 0);
++    assert(cadence.step(1, .9f, .01f, .05f, 1, 40) > 0);
++    assert(cadence.step(1, .9f, .01f, .05f, 1, 80) < 0); // 25 Hz sampling still spans both polarities.
++    assert(cadence.step(1, .9f, .01f, .05f, 1, 121) == 0); // Slower sampling resets to silence.
++    RoadRumble smooth, rough, scaled;
++    LONG smoothPeak = 0, roughPeak = 0, roughLow = 0;
++    for (uint64_t time = 0; time <= 1000; time += 10)
++    {
++        const LONG a = smooth.step(1, 0, .01f, .05f, 1, time);
++        const LONG b = rough.step(1, .9f, .01f, .05f, 1, time);
++        scaled.step(1, .9f, .01f, .05f, 2, time);
++        assert(std::abs(a) <= 100 && std::abs(b) <= 500);
++        smoothPeak = (std::max)(smoothPeak, a);
++        roughPeak = (std::max)(roughPeak, b);
++        roughLow = (std::min)(roughLow, b);
++    }
++    assert(smoothPeak >= 90 && roughPeak >= 450 && roughLow <= -450);
++    assert(std::abs(smooth.amplitude - 100) < 1 && std::abs(rough.amplitude - 500) < 1);
++    assert(std::abs(scaled.amplitude - 250) < 1); // Raw-speed calibration affects the envelope.
++    smooth.step(1, .9f, .01f, .05f, 1, 1010);
++    assert(smooth.amplitude <= 151); // Surface onset ramps instead of jumping to 500.
++    assert(rough.step(0, .9f, .01f, .05f, 1, 1010) == 0 && !rough.started); // Stationary.
++    assert(rough.step(1, .9f, .01f, .05f, 1, 1020) == 0); // Resume starts at zero.
++    assert(rough.step(1, .9f, .01f, .05f, 1, 1061) == 0 && rough.amplitude == 0); // Low-FPS suppression.
++    assert(rough.step(1, .9f, .01f, .05f, 1, 1200) == 0); // Stale callback.
++    assert(rough.step(1, .9f, .01f, .05f, 1, 1190) == 0); // Backward clock.
++    const float nan = std::numeric_limits<float>::quiet_NaN();
++    const float inf = std::numeric_limits<float>::infinity();
++    for (auto values : { std::array{nan,.5f,.01f,.05f,1.f}, std::array{inf,.5f,.01f,.05f,1.f},
++            std::array{-1.f,.5f,.01f,.05f,1.f}, std::array{11.f,.5f,.01f,.05f,1.f},
++            std::array{1.f,-1.f,.01f,.05f,1.f}, std::array{1.f,1.1f,.01f,.05f,1.f},
++            std::array{1.f,nan,.01f,.05f,1.f}, std::array{1.f,.5f,nan,.05f,1.f},
++            std::array{1.f,.5f,-.01f,.05f,1.f}, std::array{1.f,.5f,.01f,inf,1.f},
++            std::array{1.f,.5f,.01f,-.05f,1.f}, std::array{1.f,.5f,0.f,0.f,1.f},
++            std::array{1.f,.5f,.01f,.05f,0.f}, std::array{1.f,.5f,.01f,.05f,11.f},
++            std::array{1.f,.5f,.01f,.05f,nan} })
++    {
++        rough.step(1, .9f, .01f, .05f, 1, 1000);
++        rough.step(1, .9f, .01f, .05f, 1, 1020);
++        assert(rough.step(values[0], values[1], values[2], values[3], values[4], 1040) == 0);
++        assert(!rough.started && rough.amplitude == 0);
++    }
++    rough.reset();
++    for (uint64_t time = 0; time <= 2000; time += 10)
++        assert(std::abs(rough.step(1, .9f, 100, 100, 1, time)) <= MaxForce);
++    assert(rough.amplitude == 10000);
++    rough.step(1, .9f, .01f, .01f, 1, 2010);
++    assert(rough.amplitude <= 100); // Lowered configuration cap applies immediately.
++    rough.reset();
++    assert(rough.step(1, .9f, .01f, .05f, 1, 2020) == 0 && rough.amplitude == 0);
++
++    for (int bits = 0; bits < 32; ++bits)
++    {
++        bool enabled = bits & 1, racing = bits & 2, focus = bits & 4, blocked = bits & 8, connected = bits & 16;
++        assert(Allowed(enabled, racing, focus, blocked, connected, 1000, 999, 999) == (bits == 23));
++    }
++    assert(!Allowed(true, true, true, false, true, 1000, 900, 999));
++    assert(!Allowed(true, true, true, false, true, 1000, 999, 900));
++    assert(!Allowed(true, true, true, false, true, 1000, 1001, 999));
++
++    static_assert(DeviceMaxForce == 5000);
++    assert(LimitOutput(INT64_MAX) == 5000 && LimitOutput(INT64_MIN) == -5000);
++    assert(LimitOutput(4999) == 4999 && LimitOutput(-4999) == -4999);
++    assert(LimitOutput(5000) == 5000 && LimitOutput(-5000) == -5000);
++    assert(LimitOutput(5001) == 5000 && LimitOutput(-5001) == -5000);
++    Factory di;
++    Device output;
++    assert(SUCCEEDED(output.close()) && di.t.calls.empty()); // Disabled path is inert.
++    assert(SUCCEEDED(output.open(&di, hwnd, 0x346E, 5)));
++    assert(!di.wheel.acquired && !di.t.count("create.effect"));
++    assert(di.wheel.autocentre == DIPROPAUTOCENTER_OFF);
++    assert(SUCCEEDED(output.submit(0)) && !di.t.count("submit"));
++    assert(SUCCEEDED(output.submit(LONG_MAX)) && di.wheel.fx.output() == DeviceMaxForce);
++    di.wheel.fx.now = 90;
++    assert(SUCCEEDED(output.submit(10000))); // Same value still refreshes the lease.
++    di.wheel.fx.now = 189;
++    assert(di.wheel.fx.output() == DeviceMaxForce);
++    di.wheel.fx.now = 190;
++    assert(di.wheel.fx.output() == 0); // Simulated compliant hardware expiry.
++    assert(SUCCEEDED(output.submit(LONG_MIN)) && di.wheel.fx.output() == -DeviceMaxForce);
++    assert(SUCCEEDED(output.suspend()) && !di.wheel.acquired && di.wheel.fx.output() == 0);
++    assert(di.t.count("effect.release") == 1 && di.t.count("unacquire") == 1);
++    assert(SUCCEEDED(output.submit(0))); // Fresh zero effect after pause/focus recovery.
++    assert(di.t.count("create.effect") == 2 && di.t.count("acquire") == 2);
++    assert(SUCCEEDED(output.close()) && di.wheel.autocentre == DIPROPAUTOCENTER_ON);
++    auto count = di.t.calls.size();
++    assert(SUCCEEDED(output.close()) && di.t.calls.size() == count);
++
++    for (unsigned matches : { 0u, 2u })
++    {
++        Factory f; Device d; f.matches = matches;
++        assert(FAILED(d.open(&f, hwnd, 0x346E, 5)) && !f.t.count("create.device"));
++    }
++    for (const char* stage : { "enum", "create.device", "caps", "format", "cooperative", "axis", "effect.info", "get.autocentre", "autocentre.off" })
++    {
++        Factory f; Device d; f.t.fail = stage;
++        assert(FAILED(d.open(&f, hwnd, 0x346E, 5)));
++        f.t.fail.clear();
++        assert(SUCCEEDED(d.close()) && !f.t.count("acquire") && !f.t.count("submit"));
++        assert(f.wheel.autocentre == DIPROPAUTOCENTER_ON);
++    }
++    for (int unsupported = 0; unsupported < 3; ++unsupported)
++    {
++        Factory f; Device d;
++        if (unsupported == 0) f.wheel.hasFfb = false;
++        if (unsupported == 1) f.wheel.hasAxis = false;
++        if (unsupported == 2) f.wheel.hasDuration = false;
++        assert(FAILED(d.open(&f, hwnd, 0x346E, 5)));
++        assert(SUCCEEDED(d.close()) && !f.t.count("acquire"));
++    }
++    for (const char* stage : { "acquire", "create.effect", "duration", "submit" })
++    {
++        Factory f; Device d;
++        assert(SUCCEEDED(d.open(&f, hwnd, 0x346E, 5)));
++        f.t.fail = stage;
++        assert(FAILED(d.submit(100)) && f.t.count(stage) == 1); // No internal retry.
++        f.t.fail.clear();
++        assert(SUCCEEDED(d.close()) && !d.opened() && !f.wheel.acquired);
++    }
++    for (DWORD duration : { DWORD(0), DWORD(101000), DWORD(INFINITE) })
++    {
++        Factory f; Device d; f.wheel.fx.reportedDuration = duration;
++        assert(SUCCEEDED(d.open(&f, hwnd, 0x346E, 5)));
++        assert(FAILED(d.submit(100)) && !f.t.count("submit"));
++        assert(SUCCEEDED(d.close()));
++    }
++    for (const char* stage : { "stop", "stopall", "unacquire", "autocentre.restore" })
++    {
++        Factory f; Device d;
++        assert(SUCCEEDED(d.open(&f, hwnd, 0x346E, 5)) && SUCCEEDED(d.submit(100)));
++        f.t.fail = stage;
++        assert(FAILED(d.close()) && !d.opened());
++        assert(f.t.count("effect.release") == 1 && f.t.count("unacquire") == 1);
++        assert(f.t.count("autocentre.restore") == 1 && f.t.count("device.release") == 1);
++    }
++    std::cout << "PASS: actual 0..1 strengths, 100% model range / HARD 50% DEVICE CAP, collision signature/pulses/cooldown/reset, centring/road/gear models, gates and device cleanup (fake COM; no hardware)\n";
++}
+diff --git a/tests/native_rpm_leds_test.cpp b/tests/native_rpm_leds_test.cpp
+new file mode 100644
+index 0000000..9f5fec1
+--- /dev/null
++++ b/tests/native_rpm_leds_test.cpp
+@@ -0,0 +1,80 @@
++#include "../src/native_rpm_leds.hpp"
++#include <algorithm>
++#include <cassert>
++#include <iostream>
++#include <vector>
++
++int main()
++{
++    using namespace NativeRpmLeds;
++    const std::vector<uint8_t> zero{0x7e,6,0x41,0x13,0xfd,0xde,0,0,0,0,0xc0};
++    const std::vector<uint8_t> full{0x7e,6,0x41,0x13,0xfd,0xde,0,0,3,255,0xc2};
++    for (unsigned mask = 0; mask <= 1023; ++mask)
++    {
++        const auto encoded = Encode(uint16_t(mask));
++        std::vector<uint8_t> wire(encoded.bytes.begin(), encoded.bytes.begin() + encoded.size);
++        if (mask == 0) assert(wire == zero);
++        if (mask == 1023) assert(wire == full);
++        assert(wire[0] == 0x7e && wire[1] == 6 && encoded.size <= encoded.bytes.size());
++        std::vector<uint8_t> decoded;
++        for (size_t i = 2; i < wire.size(); ++i)
++        {
++            const auto byte = wire[i];
++            decoded.push_back(byte);
++            if (byte == 0x7e) { ++i; assert(i < wire.size() && wire[i] == byte); }
++        }
++        assert(decoded.size() == 9);
++        assert(decoded[0] == 0x41 && decoded[1] == 0x13 && decoded[2] == 0xfd && decoded[3] == 0xde);
++        assert(decoded[4] == 0 && decoded[5] == 0 && decoded[6] * 256u + decoded[7] == mask);
++        unsigned checksum = 0x0d + 0x7e + 6;
++        for (size_t i = 0; i < 8; ++i) checksum += decoded[i] * (decoded[i] == 0x7e ? 2u : 1u);
++        assert(uint8_t(checksum) == decoded[8]);
++    }
++    assert(Encode(126).size == 12); // Escaped payload.
++    assert(Encode(190).size == 12); // Escaped checksum.
++    bool rejected = false;
++    try { (void)Encode(1024); } catch (const std::invalid_argument&) { rejected = true; }
++    assert(rejected);
++
++    assert(ValidRange(4000, 8000));
++    assert(!ValidRange(0, 8000) && !ValidRange(8000, 8000) && !ValidRange(8001, 8000));
++    assert(!ValidRange(100, 20001) && !ValidRange(-1, 8000));
++    assert(Mask(3999, 4000, 8000) == 0 && Mask(4000, 4000, 8000) == 1);
++    assert(Mask(7999, 4000, 8000) == 511 && Mask(8000, 4000, 8000) == 1023);
++    assert(Mask(20000, 4000, 8000) == 1023 && Mask(20001, 4000, 8000) == 0);
++    assert(Mask(0xffffffffu, 4000, 8000) == 0 && Mask(5000, 8000, 4000) == 0);
++    for (const auto range : {std::pair{100,101}, std::pair{4000,8000}, std::pair{100,20000}})
++    {
++        uint16_t previous = 0;
++        for (uint32_t rpm = 0; rpm <= MaxRpm; ++rpm)
++        {
++            const auto mask = Mask(rpm, range.first, range.second);
++            assert(mask >= previous && mask <= FullMask && (mask & (mask + 1)) == 0);
++            previous = mask;
++        }
++        for (unsigned led = 0; led < 10; ++led)
++        {
++            const auto threshold = unsigned(range.first) + (led * unsigned(range.second - range.first) + 8) / 9;
++            assert(Mask(threshold, range.first, range.second) & (1u << led));
++            assert(!(Mask(threshold - 1, range.first, range.second) & (1u << led)));
++        }
++    }
++
++    Mailbox mailbox;
++    assert(mailbox.read(1000, true) == 0);
++    mailbox.publish(1023, 1000);
++    assert(mailbox.read(1000, true) == 1023 && mailbox.read(1249, true) == 1023);
++    assert(mailbox.read(1250, true) == 0 && mailbox.read(999, true) == 0);
++    assert(mailbox.read(1001, false) == 0);
++    mailbox.clear(); // Pause, overlay, focus loss, disconnect, shutdown.
++    assert(mailbox.read(1001, true) == 0);
++    mailbox.publish(1, 2000);
++    assert(mailbox.read(2001, true) == 1);
++    mailbox.publish(1024, 2002);
++    assert(mailbox.read(2002, true) == 0);
++    mailbox.publish(1, 0);
++    assert(mailbox.read(0, true) == 0);
++    mailbox.publish(1, uint64_t{1} << 48);
++    assert(mailbox.read(uint64_t{1} << 48, true) == 0);
++    std::cout << "PASS: R3 LED vectors/all masks, stuffing, bounds, RPM thresholds and atomic sample expiry/clearing (no hardware)\n";
++}
+diff --git a/tests/run-contact-tests.cmd b/tests/run-contact-tests.cmd
+new file mode 100644
+index 0000000..a10556d
+--- /dev/null
++++ b/tests/run-contact-tests.cmd
+@@ -0,0 +1,32 @@
++@echo off
++setlocal
++rem Hardware-free synthetic suite. Optional contact CSV is never bundled/required.
++if not "%~2"=="" exit /b 2
++where cl >nul 2>nul
++if errorlevel 1 (
++    for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars32.bat" >nul
++)
++set "work=%TEMP%\outrun-feedback-%RANDOM%-%RANDOM%"
++mkdir "%work%" || exit /b 1
++for %%s in (native_ffb_test contact_models_test drift_feedback_test combined_effects_test) do (
++    cl /nologo /std:c++20 /EHsc /W4 /WX /UNDEBUG /DWIN32_LEAN_AND_MEAN /DDIRECTINPUT_VERSION=0x0800 "%~dp0%%s.cpp" /Fo:"%work%\%%s.obj" /Fe:"%work%\%%s.exe" /link dxguid.lib dinput8.lib
++    if errorlevel 1 goto failed
++    if not errorlevel 0 goto failed
++)
++"%work%\native_ffb_test.exe"
++if not "%errorlevel%"=="0" goto failed
++if "%~1"=="" (
++    "%work%\contact_models_test.exe"
++) else (
++    "%work%\contact_models_test.exe" "%~1"
++)
++if not "%errorlevel%"=="0" goto failed
++"%work%\drift_feedback_test.exe"
++if not "%errorlevel%"=="0" goto failed
++"%work%\combined_effects_test.exe"
++if not "%errorlevel%"=="0" goto failed
++rmdir /s /q "%work%"
++exit /b 0
++:failed
++rmdir /s /q "%work%"
++exit /b 1
+diff --git a/tests/run-native-ffb-tests.cmd b/tests/run-native-ffb-tests.cmd
+new file mode 100644
+index 0000000..7ba1af6
+--- /dev/null
++++ b/tests/run-native-ffb-tests.cmd
+@@ -0,0 +1,18 @@
++@echo off
++setlocal
++rem Fake COM only: this does not launch the game, enumerate hardware or send forces.
++where cl >nul 2>nul
++if errorlevel 1 (
++    for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars32.bat" >nul
++)
++set "work=%TEMP%\outrun-native-ffb-%RANDOM%-%RANDOM%"
++mkdir "%work%" || exit /b 1
++cl /nologo /std:c++20 /EHsc /W4 /WX /DWIN32_LEAN_AND_MEAN /DDIRECTINPUT_VERSION=0x0800 "%~dp0native_ffb_test.cpp" /Fo:"%work%\test.obj" /Fe:"%work%\test.exe" /link dxguid.lib dinput8.lib
++if not "%errorlevel%"=="0" goto failed
++"%work%\test.exe" %*
++if not "%errorlevel%"=="0" goto failed
++rmdir /s /q "%work%"
++exit /b 0
++:failed
++rmdir /s /q "%work%"
++exit /b 1
+diff --git a/tests/run-native-rpm-led-tests.cmd b/tests/run-native-rpm-led-tests.cmd
+new file mode 100644
+index 0000000..b4e9095
+--- /dev/null
++++ b/tests/run-native-rpm-led-tests.cmd
+@@ -0,0 +1,18 @@
++@echo off
++setlocal
++rem Encoding/model/mailbox tests only: no game, serial, device enumeration or forces.
++where cl >nul 2>nul
++if errorlevel 1 (
++    for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars32.bat" >nul
++)
++set "work=%TEMP%\outrun-rpm-leds-%RANDOM%-%RANDOM%"
++mkdir "%work%" || exit /b 1
++cl /nologo /std:c++20 /EHsc /W4 /WX "%~dp0native_rpm_leds_test.cpp" /Fo:"%work%\test.obj" /Fe:"%work%\test.exe"
++if errorlevel 1 goto failed
++"%work%\test.exe"
++if errorlevel 1 goto failed
++rmdir /s /q "%work%"
++exit /b 0
++:failed
++rmdir /s /q "%work%"
++exit /b 1

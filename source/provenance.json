@@ -1,0 +1,57 @@
+{
+  "base_commit": "08e5efb4deea4066c440307ec009c868a30562d3",
+  "generator": "Visual Studio 18 2026",
+  "architecture": "Win32",
+  "compiler": "MSVC 19.51.36256.0",
+  "configuration": "Release",
+  "cmake": "4.3.1-msvc1",
+  "fetch_dependencies": {
+    "flac-src": "1507800de4b70e21be71f38caa0d9079d0bc6e45",
+    "jsoncpp-src": "8519b8381f3c741ad1421f88237b1deda0b11412",
+    "miniupnpc-src": "b5e5d2eb069822b7f00d56c8e61033b9d500e60c",
+    "ogg-src": "be05b13e98b048f0b5a0f5fa8ce514d56db5f822",
+    "safetyhook-src": "f44cc070a8340f2f26649553c49533475417304d",
+    "sdl-src": "f87239e71e42da91ca317a12eefb82cfbf3393eb",
+    "zlib-src": "da607da739fa6047df13e66a2af6b8bec7c2a498",
+    "zydis-src": "569320ad3c4856da13b9dbf1f0d9e20bda63870e"
+  },
+  "submodules": {
+    "external/IXWebSocket": "64fae7676bd8fe31f7cb4bcde7a6841892dad65e",
+    "external/ModUtils": "f90062d74a67d000df6bab25bb69960c8f100b1b",
+    "external/imgui": "f1cc2ae15e53a861a874c3034aae6798fde194ab",
+    "external/spdlog": "79524ddd08a4ec981b7fea76afd08ee05f83755d",
+    "external/xxHash": "e626a72bc2321cd320e953a0ccf1584cad60f363"
+  },
+  "patch_sha256": "5c8c63df2dec4ad841b986ecf81dfb58de96893cd1fc26de8fab0f5418d4e4db",
+  "build_label": "native-wheel-ffb-contact-drift-v0.2.0",
+  "hardware_validated": true,
+  "hardware_validation_scope": "I tested the integrated all-effects patch across three sessions and encountered no problems. The neutral-path DLL has byte-identical PE sections to the tested build; I consider this a hardware smoke validation, not general detector accuracy, torque or lifecycle certification.",
+  "force_strength_range": [
+    0.0,
+    1.0
+  ],
+  "combined_directinput_cap": 5000,
+  "nested_zycore_commit": "74620eefd233bec20daeb66e78e744ff06e273b7",
+  "reference_commit": "15f64f29a29e1dbb748a49d16d21b995ba5de83e",
+  "source_repository": "https://github.com/emoose/OutRun2006Tweaks",
+  "parser_notice_sha256": {
+    "ini-cpp-LICENSE.txt": "410045616f4e1635b54cb1005b4b8fa4fca05d6277957157c218000cbbbf7dc3",
+    "inih-LICENSE.txt": "9ae3b39e83e9158e44b67733baa3bb2d84e80efdcfb14a5820210a42c7abdf7f"
+  },
+  "original_r2_patch_sha256": "9a566ab7c2a2163c3436834333f42b8be27b3a1ee8fd038babf2b5b4187126fa",
+  "led_protocol_reference": "francisdb/moza-rev@6a3cf66c734dde29126e6d9b296adeab4479d005",
+  "rotation_changed": false,
+  "drift_damping_range_percent": [
+    0,
+    100
+  ],
+  "legacy_trial_peak_setting_included": false,
+  "software_checks": [
+    "Win32 Release build",
+    "clean pinned twenty-file patch and synthetic contact/drift/combined/FFB/LED suites",
+    "negative Windows exit propagation",
+    "C++ button-name round trips",
+    "virtual SDL wheel mapping",
+    "20% damping behavior equivalence (no captures distributed)"
+  ]
+}
